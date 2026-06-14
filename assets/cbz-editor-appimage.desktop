@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Éditeur CBZ
+Exec=cbz-editor %f
+Icon=cbz-editor
+Categories=Graphics;
+Terminal=false
+StartupWMClass=cbz-editor
+MimeType=application/vnd.comicbook+zip;application/x-cbz;

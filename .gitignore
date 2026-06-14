@@ -1,0 +1,5 @@
+/target
+/AppDir
+/.aitools
+*.AppImage
+*.deb

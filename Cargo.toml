@@ -1,0 +1,43 @@
+[package]
+name = "cbz-editor"
+version = "0.1.0"
+edition = "2021"
+description = "Éditeur de CBZ : pages, doubles-pages et couverture"
+license = "MIT"
+
+[dependencies]
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+zip = "2"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[profile.release]
+opt-level = 2
+
+[package.metadata.deb]
+maintainer = "Belenos-Toutatis <135686321+Belenos-Toutatis@users.noreply.github.com>"
+copyright = "2026, Belenos-Toutatis"
+section = "graphics"
+priority = "optional"
+# $auto détecte les libs liées ; on ajoute libGL/libEGL (dlopen, rendu OpenGL)
+# et xdg-desktop-portal (dialogue de fichiers natif via D-Bus).
+depends = "$auto, libgl1, libegl1, xdg-desktop-portal"
+extended-description = """\
+Éditeur de fichiers CBZ (bandes dessinées / mangas) avec interface graphique :
+ - supprimer, réordonner et insérer des pages ;
+ - fusionner ou découper les doubles-pages (ligne de coupe déplaçable, sens RTL/LTR) ;
+ - recadrer une page pour en faire la couverture ;
+ - agrandir les pages pour les inspecter.
+Conserve le ComicInfo.xml et recalcule le nombre de pages."""
+assets = [
+    ["target/release/cbz-editor", "usr/bin/", "755"],
+    ["assets/cbz-editor.desktop", "usr/share/applications/cbz-editor.desktop", "644"],
+    ["assets/icon-16.png", "usr/share/icons/hicolor/16x16/apps/cbz-editor.png", "644"],
+    ["assets/icon-32.png", "usr/share/icons/hicolor/32x32/apps/cbz-editor.png", "644"],
+    ["assets/icon-48.png", "usr/share/icons/hicolor/48x48/apps/cbz-editor.png", "644"],
+    ["assets/icon-64.png", "usr/share/icons/hicolor/64x64/apps/cbz-editor.png", "644"],
+    ["assets/icon-128.png", "usr/share/icons/hicolor/128x128/apps/cbz-editor.png", "644"],
+    ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/cbz-editor.png", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/cbz-editor.png", "644"],
+]
+
