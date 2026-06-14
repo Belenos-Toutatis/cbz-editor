@@ -327,14 +327,25 @@ impl CbzApp {
 
     // Index d'insertion correspondant à une position écran, dans la grille (ordre de lecture).
     fn drop_index(&self, pos: Pos2) -> usize {
-        for (i, r) in &self.card_rects {
-            let later_row = r.top() > pos.y;
-            let same_row = pos.y >= r.top() && pos.y <= r.bottom();
-            if later_row || (same_row && pos.x <= r.center().x) {
-                return *i;
+        if self.card_rects.is_empty() {
+            return self.pages.len();
+        }
+        // carte dont le centre est le plus proche du curseur (robuste aux interstices)
+        let mut best = self.card_rects[0];
+        let mut best_d = f32::MAX;
+        for &(i, r) in &self.card_rects {
+            let d = r.center().distance_sq(pos);
+            if d < best_d {
+                best_d = d;
+                best = (i, r);
             }
         }
-        self.pages.len()
+        // insérer avant ou après cette carte selon le côté du curseur
+        if pos.x < best.1.center().x {
+            best.0
+        } else {
+            best.0 + 1
+        }
     }
 
     // Petite barre verticale marquant l'endroit où l'image sera insérée.
