@@ -119,6 +119,8 @@ struct CbzApp {
     dirty_order: bool,
     status: String,
     confirm_overwrite: bool,
+    card_rects: Vec<(usize, Rect)>,
+    drop_pos: Option<Pos2>,
 }
 
 impl CbzApp {
@@ -319,6 +321,28 @@ impl CbzApp {
                 vs.idx = n as usize;
                 vs.tex = None;
             }
+        }
+    }
+
+    // Index d'insertion correspondant à une position écran, dans la grille (ordre de lecture).
+    fn drop_index(&self, pos: Pos2) -> usize {
+        for (i, r) in &self.card_rects {
+            let later_row = r.top() > pos.y;
+            let same_row = pos.y >= r.top() && pos.y <= r.bottom();
+            if later_row || (same_row && pos.x <= r.center().x) {
+                return *i;
+            }
+        }
+        self.pages.len()
+    }
+
+    // Petite barre verticale marquant l'endroit où l'image sera insérée.
+    fn insert_marker(&self, idx: usize) -> Option<Rect> {
+        if let Some((_, r)) = self.card_rects.iter().find(|(i, _)| *i == idx) {
+            Some(Rect::from_min_max(Pos2::new(r.left() - 4.0, r.top()), Pos2::new(r.left(), r.bottom())))
+        } else {
+            let (_, r) = self.card_rects.last()?;
+            Some(Rect::from_min_max(Pos2::new(r.right(), r.top()), Pos2::new(r.right() + 4.0, r.bottom())))
         }
     }
 
@@ -728,11 +752,12 @@ impl CbzApp {
 
     fn grid_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut action: Option<GridAction> = None;
+        let mut rects: Vec<(usize, Rect)> = Vec::new();
         let n = self.pages.len();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (idx, page) in self.pages.iter_mut().enumerate() {
-                    ui.allocate_ui(Vec2::new(178.0, 252.0), |ui| {
+                    let card = ui.allocate_ui(Vec2::new(178.0, 252.0), |ui| {
                         egui::Frame::group(ui.style())
                             .fill(if page.delete {
                                 Color32::from_rgb(60, 30, 30)
@@ -812,9 +837,11 @@ impl CbzApp {
                                 });
                             });
                     });
+                    rects.push((idx, card.response.rect));
                 }
             });
         });
+        self.card_rects = rects;
 
         match action {
             Some(GridAction::Enlarge(i)) => self.open_viewer(i),
@@ -1098,17 +1125,58 @@ impl eframe::App for CbzApp {
             }
         }
 
-        // glisser-déposer
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        // glisser-déposer : un .cbz s'ouvre, une image s'insère à la position du lâcher
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if hovering {
+            if let Some(p) = ctx.input(|i| i.pointer.latest_pos()) {
+                self.drop_pos = Some(p);
+            }
+        }
+        let dropped: Vec<(Option<PathBuf>, Option<std::sync::Arc<[u8]>>, String)> = ctx.input(|i| {
+            i.raw.dropped_files.iter().map(|f| (f.path.clone(), f.bytes.clone(), f.name.clone())).collect()
         });
-        if let Some(p) = dropped.into_iter().find(|p| {
-            p.extension().map_or(false, |e| {
-                let e = e.to_string_lossy().to_lowercase();
-                e == "cbz" || e == "zip"
-            })
-        }) {
-            self.open_cbz(p);
+        if !dropped.is_empty() {
+            if let Some(p) = dropped.iter().find_map(|(p, _, _)| p.clone().filter(|p| is_cbz_path(p))) {
+                self.open_cbz(p);
+            } else if self.path.is_some() && self.crop.is_none() && self.split.is_none() && self.viewer.is_none() {
+                let mut at = self.drop_pos.map(|pos| self.drop_index(pos)).unwrap_or(self.pages.len());
+                let mut count = 0;
+                for (path, bytes, name) in &dropped {
+                    let ext = path
+                        .as_ref()
+                        .and_then(|p| p.extension())
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                        .or_else(|| Path::new(name).extension().map(|e| e.to_string_lossy().to_lowercase()))
+                        .unwrap_or_default();
+                    if !is_image_ext(&ext) {
+                        continue;
+                    }
+                    let data = match path {
+                        Some(p) => std::fs::read(p).ok(),
+                        None => bytes.as_ref().map(|b| b.to_vec()),
+                    };
+                    if let Some(data) = data {
+                        let uid = self.next_uid;
+                        self.next_uid += 1;
+                        let nm = path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| name.clone());
+                        let at_clamped = at.min(self.pages.len());
+                        self.pages.insert(
+                            at_clamped,
+                            Page { name: nm, bytes: data, thumb: None, failed: false, delete: false, uid },
+                        );
+                        at = at_clamped + 1;
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    self.dirty_order = true;
+                    self.status = format!("{count} image(s) insérée(s) — renumérotation à l'enregistrement.");
+                }
+            }
         }
 
         self.generate_thumbnails(ctx);
@@ -1131,11 +1199,28 @@ impl eframe::App for CbzApp {
             }
         });
 
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+        if hovering {
             let p = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("dnd-overlay")));
-            let r = ctx.screen_rect();
-            p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 130));
-            p.text(r.center(), Align2::CENTER_CENTER, "Déposez le .cbz ici", FontId::proportional(30.0), Color32::WHITE);
+            let in_grid = self.path.is_some() && self.crop.is_none() && self.split.is_none() && self.viewer.is_none();
+            if in_grid {
+                if let Some(pos) = self.drop_pos {
+                    if let Some(m) = self.insert_marker(self.drop_index(pos)) {
+                        p.rect_filled(m, 2.0, Color32::from_rgb(0, 180, 255));
+                    }
+                }
+                let sr = ctx.screen_rect();
+                p.text(
+                    Pos2::new(sr.center().x, sr.top() + 92.0),
+                    Align2::CENTER_CENTER,
+                    "Lâcher pour insérer l'image ici",
+                    FontId::proportional(20.0),
+                    Color32::from_rgb(0, 180, 255),
+                );
+            } else {
+                let r = ctx.screen_rect();
+                p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 130));
+                p.text(r.center(), Align2::CENTER_CENTER, "Déposez un .cbz ici", FontId::proportional(30.0), Color32::WHITE);
+            }
         }
 
         if self.confirm_overwrite {
@@ -1282,6 +1367,17 @@ fn fit(size: [usize; 2], max: Vec2) -> Vec2 {
     }
     let s = (max.x / w).min(max.y / h);
     Vec2::new(w * s, h * s)
+}
+
+fn is_cbz_path(p: &Path) -> bool {
+    p.extension().map_or(false, |e| {
+        let e = e.to_string_lossy().to_lowercase();
+        e == "cbz" || e == "zip"
+    })
+}
+
+fn is_image_ext(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp")
 }
 
 fn short_name(name: &str) -> String {
