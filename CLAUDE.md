@@ -37,14 +37,26 @@ l'appli avec un vrai `.cbz` (un « smoke test » de 3-4 s suffit à confirmer qu
   `async-std` marche.
 - **X11 forcé** : `main()` retire `WAYLAND_DISPLAY` pour que winit utilise X11/XWayland, où le
   **glisser-déposer de fichiers** fonctionne (le Wayland natif de winit ne le livre pas).
-- **Limite connue** : la **position** d'un drop de fichier **externe** n'est pas fiable sous X11
-  (winit ne transmet pas la position du curseur pendant un drag externe → `hovered_files` vide,
-  pas de barre d'aperçu, insertion approximative). Le **glisser interne** d'une vignette, lui,
-  est précis (egui suit le pointeur) → c'est le moyen fiable de positionner.
+- **Drop de fichier externe** : la **position** n'est pas fiable sous X11 (winit ne transmet pas
+  la position du curseur pendant un drag externe → `hovered_files` vide). Du coup une image lâchée
+  est **toujours insérée en page 1** (en tête) et un **toast** (~`TOAST_SECS` s, champ `toast`) le
+  signale. Le **glisser interne** d'une vignette, lui, est précis (egui suit le pointeur) →
+  c'est le moyen fiable de **repositionner** une page ensuite.
+- **Doublons** : « 🧹 Marquer les doublons » (barre du haut, `mark_all_duplicates`) et « Cocher
+  les copies identiques » (clic droit, `mark_identical`) cochent pour suppression les pages au
+  **contenu strictement identique** (octets, via `duplicate_groups`/`content_hash`). **Toutes** les
+  copies sont cochées, on n'en garde aucune. Comparaison **exacte** (pas de similarité perceptuelle)
+  → sûr, mais ne repère pas un même visuel ré-encodé.
+- **Lecture robuste** : pages triées en **ordre naturel** (`natural_cmp` : `p2` < `p10`, jamais
+  de tri lexical) ; lecture ZIP **plafonnée** (512 Mio/entrée, 4 Gio au total) contre les bombes
+  zip ; formats décodés **JPEG/PNG/WebP/GIF/BMP** ; une page illisible affiche un cadre
+  « ⚠ illisible » cliquable (jamais de spinner infini, ni en grille ni dans le viewer).
 - **Enregistrement** (`build_cbz`) : couverture en `000_cover.jpg` ; `ComicInfo.xml` conservé,
-  `PageCount` réécrit. Les pages gardent leur **nom d'origine** SAUF si l'ordre a changé
-  (`dirty_order` : réordre/insertion/fusion/découpe) → renumérotées `p0000.jpg`… pour figer
-  l'ordre (les lecteurs trient par nom). Écriture **atomique** (.tmp puis rename) + `.bak`.
+  `PageCount` réécrit (au **niveau octets**, pour préserver un XML non‑UTF‑8). Les pages gardent
+  leur **nom d'origine** SAUF si l'ordre a changé (`dirty_order` : réordre/insertion/fusion/découpe)
+  → renumérotées `p0000.jpg`… pour figer l'ordre (les lecteurs trient par nom). Écriture
+  **atomique** (.tmp puis rename) + `.bak`. « Enregistrer une copie » n'écrase jamais une copie
+  existante (suffixe `(édité 2)`…). `encode_jpeg` remonte ses erreurs (pas de page vide silencieuse).
 - **Sens de lecture** (`rtl`) déduit du `ComicInfo` (`YesAndRightToLeft`), modifiable dans l'UI ;
   il pilote l'ordre des fusion/découpe.
 - `last_dir` persisté dans `~/.config/cbz-editor/last_dir`.

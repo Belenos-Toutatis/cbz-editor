@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 eframe = "0.29"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 zip = "2"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 

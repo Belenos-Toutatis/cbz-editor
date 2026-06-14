@@ -10,6 +10,9 @@ use egui::{
 use std::io::{Cursor, Read, Write as _};
 use std::path::{Path, PathBuf};
 
+// Durée d'affichage du petit message éphémère (« toast ») après un dépôt d'image.
+const TOAST_SECS: f64 = 2.0;
+
 fn main() -> eframe::Result<()> {
     // Forcer X11/XWayland : le glisser-déposer de fichiers y est fiable.
     if std::env::var_os("DISPLAY").is_some() {
@@ -79,6 +82,7 @@ struct CropState {
 struct ViewerState {
     idx: usize,
     tex: Option<TextureHandle>,
+    failed: bool,
 }
 
 struct SplitState {
@@ -101,6 +105,7 @@ enum GridAction {
     MergeNext(usize),
     Split(usize),
     Extract(usize),
+    MarkIdentical(usize),
 }
 
 #[derive(Default)]
@@ -120,8 +125,8 @@ struct CbzApp {
     status: String,
     confirm_overwrite: bool,
     card_rects: Vec<(usize, Rect)>,
-    drop_pos: Option<Pos2>,
     drag_page: Option<u64>,
+    toast: Option<(String, f64)>,
 }
 
 impl CbzApp {
@@ -172,7 +177,7 @@ impl CbzApp {
 
     fn pick_image_page(&mut self) -> Option<Page> {
         let mut dlg = rfd::FileDialog::new()
-            .add_filter("Images (jpg, png, webp, gif)", &["jpg", "jpeg", "png", "webp", "gif"])
+            .add_filter("Images (jpg, png, webp, gif, bmp)", &["jpg", "jpeg", "png", "webp", "gif", "bmp"])
             .set_title("Image à insérer");
         if let Some(d) = self.last_dir.as_ref().filter(|d| d.is_dir()) {
             dlg = dlg.set_directory(d);
@@ -236,28 +241,131 @@ impl CbzApp {
         }
     }
 
+    // Coche pour suppression toutes les pages d'un groupe de doublons (contenu
+    // strictement identique). On n'en garde aucune : toutes les copies sont cochées.
+    fn mark_all_duplicates(&mut self) {
+        let groups = self.duplicate_groups();
+        let mut marked = 0usize;
+        for g in &groups {
+            for &i in g {
+                if !self.pages[i].delete {
+                    self.pages[i].delete = true;
+                    marked += 1;
+                }
+            }
+        }
+        self.status = if marked == 0 {
+            "Aucun doublon (contenu identique) détecté.".into()
+        } else {
+            format!(
+                "🧹 {marked} page(s) en double cochée(s) pour suppression ({} groupe(s)).",
+                groups.len()
+            )
+        };
+    }
+
+    // Coche pour suppression toutes les pages au contenu identique à `idx` (y compris
+    // celle-ci), à condition qu'il existe au moins une autre copie.
+    fn mark_identical(&mut self, idx: usize) {
+        let same: Vec<usize> = {
+            let Some(rp) = self.pages.get(idx) else { return };
+            let rb = &rp.bytes;
+            self.pages
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| &p.bytes == rb)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        if same.len() < 2 {
+            self.status = "Aucune autre copie identique à cette page.".into();
+            return;
+        }
+        for &i in &same {
+            self.pages[i].delete = true;
+        }
+        self.status = format!("🧹 {} copies identiques cochées pour suppression.", same.len());
+    }
+
+    // Groupes de pages au contenu strictement identique (octets), de taille ≥ 2.
+    fn duplicate_groups(&self) -> Vec<Vec<usize>> {
+        use std::collections::HashMap;
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, p) in self.pages.iter().enumerate() {
+            by_hash.entry(content_hash(&p.bytes)).or_default().push(i);
+        }
+        let mut groups = Vec::new();
+        for idxs in by_hash.into_values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            // Lever les collisions de hash : regrouper par égalité d'octets exacte.
+            let mut buckets: Vec<Vec<usize>> = Vec::new();
+            for i in idxs {
+                match buckets
+                    .iter_mut()
+                    .find(|b| self.pages[b[0]].bytes == self.pages[i].bytes)
+                {
+                    Some(b) => b.push(i),
+                    None => buckets.push(vec![i]),
+                }
+            }
+            groups.extend(buckets.into_iter().filter(|b| b.len() >= 2));
+        }
+        groups
+    }
+
     fn read_cbz(path: &Path) -> Result<(Vec<Page>, Option<Vec<u8>>), String> {
+        // Garde-fous anti « bombe zip » : on borne la taille décompressée lue, par
+        // entrée et au total, pour ne pas saturer la mémoire avec un fichier piégé.
+        const MAX_ENTRY: u64 = 512 * 1024 * 1024;
+        const MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
         let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
         let mut z = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
         let mut pages = Vec::new();
-        let mut ci = None;
+        let mut ci: Option<Vec<u8>> = None;
+        let mut ci_is_comicinfo = false;
+        let mut total: u64 = 0;
         for i in 0..z.len() {
             let mut e = z.by_index(i).map_err(|e| e.to_string())?;
             if e.is_dir() {
                 continue;
             }
             let name = e.name().to_string();
-            let mut buf = Vec::new();
-            e.read_to_end(&mut buf).map_err(|e| e.to_string())?;
             let lower = name.to_lowercase();
-            if lower.ends_with(".xml") {
-                ci = Some(buf);
-            } else if lower.ends_with(".jpg")
+            let is_xml = lower.ends_with(".xml");
+            let is_img = lower.ends_with(".jpg")
                 || lower.ends_with(".jpeg")
                 || lower.ends_with(".png")
                 || lower.ends_with(".webp")
                 || lower.ends_with(".gif")
-            {
+                || lower.ends_with(".bmp");
+            if !is_xml && !is_img {
+                continue;
+            }
+            let mut buf = Vec::new();
+            e.by_ref()
+                .take(MAX_ENTRY + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| e.to_string())?;
+            if buf.len() as u64 > MAX_ENTRY {
+                return Err(format!(
+                    "entrée « {} » trop volumineuse une fois décompressée (bombe zip ?).",
+                    short_name(&name)
+                ));
+            }
+            total += buf.len() as u64;
+            if total > MAX_TOTAL {
+                return Err("archive trop volumineuse une fois décompressée — ouverture interrompue.".into());
+            }
+            if is_xml {
+                // S'il y a plusieurs .xml, préférer celui qui s'appelle ComicInfo.xml.
+                let is_comicinfo = lower.ends_with("comicinfo.xml");
+                if ci.is_none() || (is_comicinfo && !ci_is_comicinfo) {
+                    ci = Some(buf);
+                    ci_is_comicinfo = is_comicinfo;
+                }
+            } else {
                 pages.push(Page {
                     name,
                     bytes: buf,
@@ -268,7 +376,8 @@ impl CbzApp {
                 });
             }
         }
-        pages.sort_by(|a, b| a.name.cmp(&b.name));
+        // Tri « naturel » : page2 < page10 (un tri lexical donnerait page10 < page2).
+        pages.sort_by(|a, b| natural_cmp(&a.name, &b.name));
         Ok((pages, ci))
     }
 
@@ -308,7 +417,7 @@ impl CbzApp {
     }
 
     fn open_viewer(&mut self, idx: usize) {
-        self.viewer = Some(ViewerState { idx, tex: None });
+        self.viewer = Some(ViewerState { idx, tex: None, failed: false });
     }
 
     fn viewer_go(&mut self, d: i32) {
@@ -321,6 +430,7 @@ impl CbzApp {
             if n as usize != vs.idx {
                 vs.idx = n as usize;
                 vs.tex = None;
+                vs.failed = false;
             }
         }
     }
@@ -362,11 +472,7 @@ impl CbzApp {
         let Some(page) = self.pages.get(idx) else { return };
         match image::load_from_memory(&page.bytes) {
             Ok(img) => {
-                let disp = if img.width() > 1600 {
-                    img.thumbnail(1600, 4000)
-                } else {
-                    img.clone()
-                };
+                let disp = display_copy(&img, 1600);
                 let rgba = disp.to_rgba8();
                 let ci = ColorImage::from_rgba_unmultiplied(
                     [disp.width() as usize, disp.height() as usize],
@@ -400,7 +506,14 @@ impl CbzApp {
             self.crop = Some(cs);
             return;
         };
-        let bytes = encode_jpeg(&cropped, 92);
+        let bytes = match encode_jpeg(&cropped, 92) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Encodage de la couverture impossible : {e}");
+                self.crop = Some(cs);
+                return;
+            }
+        };
         let t = cropped.thumbnail(220, 320);
         let rgba = t.to_rgba8();
         let ci = ColorImage::from_rgba_unmultiplied(
@@ -434,7 +547,13 @@ impl CbzApp {
         // a est lue en 1er, b en 2e. En RTL : a à droite, b à gauche.
         let (left, right) = if self.rtl { (b, a) } else { (a, b) };
         let merged = concat_h(left, right);
-        let bytes = encode_jpeg(&merged, 92);
+        let bytes = match encode_jpeg(&merged, 92) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Fusion impossible (encodage) : {e}");
+                return;
+            }
+        };
         let uid = self.next_uid;
         self.next_uid += 1;
         self.pages[i] = Page {
@@ -454,11 +573,11 @@ impl CbzApp {
         let Some(page) = self.pages.get(idx) else { return };
         match image::load_from_memory(&page.bytes) {
             Ok(img) => {
-                let disp = if img.width() > 1800 {
-                    img.thumbnail(1800, 4000)
-                } else {
-                    img.clone()
-                };
+                if img.width() < 2 {
+                    self.status = "Cette image est trop étroite pour être découpée.".into();
+                    return;
+                }
+                let disp = display_copy(&img, 1800);
                 let rgba = disp.to_rgba8();
                 let ci = ColorImage::from_rgba_unmultiplied(
                     [disp.width() as usize, disp.height() as usize],
@@ -482,12 +601,21 @@ impl CbzApp {
     fn finish_split(&mut self) {
         let Some(ss) = self.split.take() else { return };
         let w = ss.img.width();
-        let cut = ss.cut.clamp(1, w.saturating_sub(1));
+        if w < 2 {
+            self.status = "Cette image est trop étroite pour être découpée.".into();
+            return;
+        }
+        let cut = ss.cut.clamp(1, w - 1);
         let left = ss.img.crop_imm(0, 0, cut, ss.img.height());
         let right = ss.img.crop_imm(cut, 0, w - cut, ss.img.height());
         let (first, second) = if ss.rtl { (right, left) } else { (left, right) };
-        let fb = encode_jpeg(&first, 92);
-        let sb = encode_jpeg(&second, 92);
+        let (fb, sb) = match (encode_jpeg(&first, 92), encode_jpeg(&second, 92)) {
+            (Ok(f), Ok(s)) => (f, s),
+            _ => {
+                self.status = "Découpe impossible (encodage des deux moitiés).".into();
+                return;
+            }
+        };
         let u1 = self.next_uid;
         let u2 = self.next_uid + 1;
         self.next_uid += 2;
@@ -560,7 +688,8 @@ impl CbzApp {
             if resp.dragged() || resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let fx = ((p.x - area.left()) / area.width().max(1.0) * iw as f32).round();
-                    ss.cut = (fx as i32).clamp(1, iw as i32 - 1) as u32;
+                    let hi = (iw as i32 - 1).max(1);
+                    ss.cut = (fx as i32).clamp(1, hi) as u32;
                 }
             }
             if resp.hovered() {
@@ -672,10 +801,12 @@ impl CbzApp {
             tmp.push(".tmp");
             let tmp = PathBuf::from(tmp);
             if let Err(e) = std::fs::write(&tmp, &data) {
+                let _ = std::fs::remove_file(&tmp);
                 self.status = format!("Écriture impossible : {e}");
                 return;
             }
             if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
                 self.status = format!("Remplacement impossible : {e}");
                 return;
             }
@@ -686,7 +817,13 @@ impl CbzApp {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "sortie".into());
             let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-            let out = parent.join(format!("{stem} (édité).cbz"));
+            // Ne jamais écraser une copie existante : suffixe incrémental si besoin.
+            let mut out = parent.join(format!("{stem} (édité).cbz"));
+            let mut k = 2;
+            while out.exists() {
+                out = parent.join(format!("{stem} (édité {k}).cbz"));
+                k += 1;
+            }
             if let Err(e) = std::fs::write(&out, &data) {
                 self.status = format!("Écriture impossible : {e}");
                 return;
@@ -730,6 +867,16 @@ impl CbzApp {
                 }
                 if self.cover.is_some() {
                     ui.colored_label(Color32::from_rgb(80, 180, 100), "· couverture ✔");
+                }
+                if ui
+                    .button("🧹 Marquer les doublons")
+                    .on_hover_text(
+                        "Coche pour suppression toutes les pages au contenu strictement identique \
+                         (toutes les copies, sans en garder une).",
+                    )
+                    .clicked()
+                {
+                    self.mark_all_duplicates();
                 }
                 ui.separator();
                 let dir = if self.rtl { "➡⬅ sens : D→G (manga)" } else { "⬅➡ sens : G→D" };
@@ -790,6 +937,24 @@ impl CbzApp {
                                             let sz = fit(tex.size(), Vec2::new(150.0, 150.0));
                                             ui.add(egui::Image::new(SizedTexture::new(tex.id(), sz)).sense(Sense::click_and_drag()))
                                         }
+                                        None if page.failed => {
+                                            // Image non décodable : cadre cliquable (clic droit/déplacer
+                                            // restent possibles) plutôt qu'un spinner qui tourne sans fin.
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                Vec2::new(150.0, 150.0),
+                                                Sense::click_and_drag(),
+                                            );
+                                            let p = ui.painter();
+                                            p.rect_filled(rect, 4.0, Color32::from_rgb(54, 40, 40));
+                                            p.text(
+                                                rect.center(),
+                                                Align2::CENTER_CENTER,
+                                                "⚠\nillisible",
+                                                FontId::proportional(15.0),
+                                                Color32::from_rgb(210, 170, 170),
+                                            );
+                                            resp
+                                        }
                                         None => ui.add_sized(Vec2::new(150.0, 150.0), egui::Spinner::new()),
                                     };
                                     if thumb.clicked() {
@@ -839,6 +1004,18 @@ impl CbzApp {
                                             ui.separator();
                                             if ui.button("💾 Extraire l'image (fichier)…").clicked() {
                                                 action = Some(GridAction::Extract(idx));
+                                                ui.close_menu();
+                                            }
+                                            ui.separator();
+                                            if ui
+                                                .button("🧹 Cocher les copies identiques")
+                                                .on_hover_text(
+                                                    "Coche pour suppression toutes les pages au \
+                                                     contenu identique à celle-ci (cette page comprise).",
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(GridAction::MarkIdentical(idx));
                                                 ui.close_menu();
                                             }
                                         });
@@ -929,6 +1106,7 @@ impl CbzApp {
             Some(GridAction::MergeNext(i)) => self.merge_next(i),
             Some(GridAction::Split(i)) => self.enter_split(i, ctx),
             Some(GridAction::Extract(i)) => self.extract_page(i),
+            Some(GridAction::MarkIdentical(i)) => self.mark_identical(i),
             _ => {}
         }
     }
@@ -959,9 +1137,12 @@ impl CbzApp {
         }
         let mut va = VAct::None;
         if let Some(vs) = self.viewer.as_mut() {
-            if vs.tex.is_none() {
+            if vs.tex.is_none() && !vs.failed {
                 if let Some(page) = self.pages.get(vs.idx) {
-                    vs.tex = decode_texture(ctx, &page.bytes, 2200);
+                    match decode_texture(ctx, &page.bytes, 2200) {
+                        Some(t) => vs.tex = Some(t),
+                        None => vs.failed = true,
+                    }
                 }
             }
             let idx = vs.idx;
@@ -1005,8 +1186,19 @@ impl CbzApp {
                     });
                 }
                 None => {
+                    let failed = vs.failed;
                     ui.centered_and_justified(|ui| {
-                        ui.add(egui::Spinner::new());
+                        if failed {
+                            ui.label(
+                                RichText::new(
+                                    "⚠ Image illisible (format non pris en charge ou fichier corrompu).",
+                                )
+                                .size(18.0)
+                                .color(Color32::from_rgb(210, 170, 170)),
+                            );
+                        } else {
+                            ui.add(egui::Spinner::new());
+                        }
                     });
                 }
             }
@@ -1158,6 +1350,7 @@ impl CbzApp {
 
 impl eframe::App for CbzApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = ctx.input(|i| i.time);
         // clavier : Échap = retour ; flèches = naviguer en mode agrandi
         let (esc, left, right) = ctx.input(|i| {
             (
@@ -1185,13 +1378,9 @@ impl eframe::App for CbzApp {
             }
         }
 
-        // glisser-déposer : un .cbz s'ouvre, une image s'insère à la position du lâcher
+        // glisser-déposer : un .cbz s'ouvre ; une image externe s'insère toujours en
+        // page 1 (sous X11 la position d'un drag externe n'est pas fiable) + petit toast.
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        // Suivre la position du curseur en continu (sur X11, hovered_files reste vide
-        // pendant un drag externe, donc on ne peut pas se fier au survol).
-        if let Some(p) = ctx.input(|i| i.pointer.latest_pos()) {
-            self.drop_pos = Some(p);
-        }
         let dropped: Vec<(Option<PathBuf>, Option<std::sync::Arc<[u8]>>, String)> = ctx.input(|i| {
             i.raw.dropped_files.iter().map(|f| (f.path.clone(), f.bytes.clone(), f.name.clone())).collect()
         });
@@ -1199,8 +1388,7 @@ impl eframe::App for CbzApp {
             if let Some(p) = dropped.iter().find_map(|(p, _, _)| p.clone().filter(|p| is_cbz_path(p))) {
                 self.open_cbz(p);
             } else if self.path.is_some() && self.crop.is_none() && self.split.is_none() && self.viewer.is_none() {
-                let drop_at = ctx.input(|i| i.pointer.interact_pos()).or(self.drop_pos);
-                let mut at = drop_at.map(|pos| self.drop_index(pos)).unwrap_or(self.pages.len());
+                let mut at = 0usize; // les images déposées vont toujours en tête (page 1)
                 let mut count = 0;
                 for (path, bytes, name) in &dropped {
                     let ext = path
@@ -1235,7 +1423,15 @@ impl eframe::App for CbzApp {
                 }
                 if count > 0 {
                     self.dirty_order = true;
-                    self.status = format!("{count} image(s) insérée(s) — renumérotation à l'enregistrement.");
+                    let msg = if count == 1 {
+                        "🖼 Image ajoutée en page 1 — renumérotation à l'enregistrement.".to_string()
+                    } else {
+                        format!(
+                            "🖼 {count} images ajoutées en tête (pages 1–{count}) — renumérotation à l'enregistrement."
+                        )
+                    };
+                    self.status = msg.clone();
+                    self.toast = Some((msg, now + TOAST_SECS));
                 }
             }
         }
@@ -1264,16 +1460,14 @@ impl eframe::App for CbzApp {
             let p = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("dnd-overlay")));
             let in_grid = self.path.is_some() && self.crop.is_none() && self.split.is_none() && self.viewer.is_none();
             if in_grid {
-                if let Some(pos) = self.drop_pos {
-                    if let Some(m) = self.insert_marker(self.drop_index(pos)) {
-                        p.rect_filled(m, 2.0, Color32::from_rgb(0, 180, 255));
-                    }
+                if let Some(m) = self.insert_marker(0) {
+                    p.rect_filled(m, 2.0, Color32::from_rgb(0, 180, 255));
                 }
                 let sr = ctx.screen_rect();
                 p.text(
                     Pos2::new(sr.center().x, sr.top() + 92.0),
                     Align2::CENTER_CENTER,
-                    "Lâcher pour insérer l'image ici",
+                    "Lâcher : l'image sera ajoutée en page 1",
                     FontId::proportional(20.0),
                     Color32::from_rgb(0, 180, 255),
                 );
@@ -1303,6 +1497,25 @@ impl eframe::App for CbzApp {
                         }
                     });
                 });
+        }
+
+        // Petit message éphémère qui disparaît tout seul (≈ TOAST_SECS secondes).
+        if let Some((msg, exp)) = self.toast.clone() {
+            if now >= exp {
+                self.toast = None;
+            } else {
+                let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("toast")));
+                let galley =
+                    ctx.fonts(|f| f.layout_no_wrap(msg, FontId::proportional(18.0), Color32::WHITE));
+                let sr = ctx.screen_rect();
+                let center = Pos2::new(sr.center().x, sr.bottom() - 64.0);
+                let pad = Vec2::new(18.0, 12.0);
+                let rect = Rect::from_center_size(center, galley.size() + pad * 2.0);
+                painter.rect_filled(rect, 10.0, Color32::from_rgba_unmultiplied(20, 22, 26, 235));
+                painter.rect_stroke(rect, 10.0, Stroke::new(1.5, Color32::from_rgb(0, 180, 255)));
+                painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64((exp - now).max(0.0)));
+            }
         }
     }
 }
@@ -1441,6 +1654,79 @@ fn is_image_ext(ext: &str) -> bool {
     matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp")
 }
 
+// Comparaison « naturelle » de deux noms : les suites de chiffres sont comparées
+// comme des nombres (« p2 » < « p10 »), le reste octet par octet en minuscules.
+// Sans risque de débordement (les nombres sont comparés comme des chaînes).
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (si, sj) = (i, j);
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let (na, nb) = (&a[si..i], &b[sj..j]);
+            let (ta, tb) = (trim_leading_zeros(na), trim_leading_zeros(nb));
+            let by_value = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+            match by_value {
+                // Même valeur numérique : départager par longueur brute (zéros de tête).
+                Ordering::Equal => match na.len().cmp(&nb.len()) {
+                    Ordering::Equal => {}
+                    o => return o,
+                },
+                o => return o,
+            }
+        } else {
+            match a[i].to_ascii_lowercase().cmp(&b[j].to_ascii_lowercase()) {
+                Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                o => return o,
+            }
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
+}
+
+fn trim_leading_zeros(s: &[u8]) -> &[u8] {
+    let mut k = 0;
+    while k + 1 < s.len() && s[k] == b'0' {
+        k += 1;
+    }
+    &s[k..]
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+// Copie réduite d'une image pour l'affichage GPU si une dimension dépasse `max`
+// (évite de dépasser la taille de texture maximale du pilote sur les pages très hautes).
+fn display_copy(img: &image::DynamicImage, max: u32) -> image::DynamicImage {
+    if img.width() > max || img.height() > max {
+        img.thumbnail(max, max)
+    } else {
+        img.clone()
+    }
+}
+
+// Empreinte rapide du contenu d'une page, pour regrouper les doublons.
+fn content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 fn short_name(name: &str) -> String {
     let base = name.rsplit('/').next().unwrap_or(name);
     if base.chars().count() > 20 {
@@ -1451,12 +1737,13 @@ fn short_name(name: &str) -> String {
     }
 }
 
-fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Vec<u8> {
+fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     let mut out = Cursor::new(Vec::new());
     let rgb = img.to_rgb8();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
-    let _ = enc.encode_image(&rgb);
-    out.into_inner()
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode_image(&rgb)
+        .map_err(|e| e.to_string())?;
+    Ok(out.into_inner())
 }
 
 fn to_height(img: image::DynamicImage, h: u32) -> image::DynamicImage {
@@ -1481,14 +1768,16 @@ fn concat_h(left: image::DynamicImage, right: image::DynamicImage) -> image::Dyn
 }
 
 fn update_pagecount(xml: &[u8], n: usize) -> Vec<u8> {
-    let s = String::from_utf8_lossy(xml);
-    if let (Some(a), Some(b)) = (s.find("<PageCount>"), s.find("</PageCount>")) {
-        if b > a {
-            let mut out = String::with_capacity(s.len());
-            out.push_str(&s[..a + "<PageCount>".len()]);
-            out.push_str(&n.to_string());
-            out.push_str(&s[b..]);
-            return out.into_bytes();
+    // Travail au niveau octets : ne pas altérer un XML non‑UTF‑8 (UTF‑16, etc.).
+    let open = b"<PageCount>";
+    let close = b"</PageCount>";
+    if let (Some(a), Some(b)) = (find_bytes(xml, open), find_bytes(xml, close)) {
+        if b >= a + open.len() {
+            let mut out = Vec::with_capacity(xml.len());
+            out.extend_from_slice(&xml[..a + open.len()]);
+            out.extend_from_slice(n.to_string().as_bytes());
+            out.extend_from_slice(&xml[b..]);
+            return out;
         }
     }
     xml.to_vec()
