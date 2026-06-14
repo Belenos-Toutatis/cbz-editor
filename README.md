@@ -7,8 +7,8 @@ Un petit éditeur de fichiers **CBZ** (bandes dessinées / mangas) avec interfac
 
 ## Fonctionnalités
 
-- 🗑️ **Supprimer** des pages, 🔀 **réordonner** (déplacer/inverser), ➕ **insérer** une image
-  (clic droit, ou **glisser-déposer** une image sur la grille — elle s'insère à la position du lâcher).
+- 🗑️ **Supprimer** des pages, 🔀 **réordonner** (boutons, ou **glisser une vignette** à sa nouvelle place
+  avec repère visuel), ➕ **insérer** une image (clic droit, ou **glisser-déposer** une image sur la grille).
 - 🪓 **Découper** une double-page en deux pages (ligne de coupe **déplaçable**, sens de lecture RTL/LTR).
 - 🔗 **Fusionner** deux pages en une double-page (sens de lecture respecté).
 - ✂️ **Recadrer** une page pour en faire la **couverture** (`000_cover.jpg`), avec cadre déplaçable/redimensionnable.

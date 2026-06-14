@@ -121,6 +121,7 @@ struct CbzApp {
     confirm_overwrite: bool,
     card_rects: Vec<(usize, Rect)>,
     drop_pos: Option<Pos2>,
+    drag_page: Option<u64>,
 }
 
 impl CbzApp {
@@ -753,13 +754,18 @@ impl CbzApp {
     fn grid_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut action: Option<GridAction> = None;
         let mut rects: Vec<(usize, Rect)> = Vec::new();
+        let mut dragged_uid: Option<u64> = None;
+        let mut released = false;
+        let drag_uid = self.drag_page;
         let n = self.pages.len();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().drag_to_scroll(false).auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (idx, page) in self.pages.iter_mut().enumerate() {
                     let card = ui.allocate_ui(Vec2::new(178.0, 252.0), |ui| {
                         egui::Frame::group(ui.style())
-                            .fill(if page.delete {
+                            .fill(if Some(page.uid) == drag_uid {
+                                Color32::from_rgb(28, 60, 42)
+                            } else if page.delete {
                                 Color32::from_rgb(60, 30, 30)
                             } else {
                                 ui.style().visuals.faint_bg_color
@@ -771,15 +777,22 @@ impl CbzApp {
                                     let thumb = match &page.thumb {
                                         Some(tex) => {
                                             let sz = fit(tex.size(), Vec2::new(150.0, 150.0));
-                                            ui.add(egui::Image::new(SizedTexture::new(tex.id(), sz)).sense(Sense::click()))
+                                            ui.add(egui::Image::new(SizedTexture::new(tex.id(), sz)).sense(Sense::click_and_drag()))
                                         }
                                         None => ui.add_sized(Vec2::new(150.0, 150.0), egui::Spinner::new()),
                                     };
                                     if thumb.clicked() {
                                         action = Some(GridAction::Enlarge(idx));
                                     }
+                                    if thumb.dragged() {
+                                        dragged_uid = Some(page.uid);
+                                    }
+                                    if thumb.drag_stopped() {
+                                        dragged_uid = Some(page.uid);
+                                        released = true;
+                                    }
                                     thumb
-                                        .on_hover_text("Clic = agrandir · clic droit = plus d'options")
+                                        .on_hover_text("Clic = agrandir · glisser = déplacer · clic droit = options")
                                         .context_menu(|ui| {
                                             if ui.button("🔍 Voir en grand").clicked() {
                                                 action = Some(GridAction::Enlarge(idx));
@@ -843,6 +856,28 @@ impl CbzApp {
         });
         self.card_rects = rects;
 
+        // déplacement interne d'une page par glisser (avec barre à la position cible)
+        if let Some(uid) = dragged_uid {
+            let pos = ctx.input(|i| i.pointer.interact_pos());
+            if released {
+                self.drag_page = None;
+                if let Some(p) = pos {
+                    let t = self.drop_index(p);
+                    self.move_page_to(uid, t);
+                }
+            } else {
+                self.drag_page = Some(uid);
+                if let Some(p) = pos {
+                    if let Some(m) = self.insert_marker(self.drop_index(p)) {
+                        ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("reorder")))
+                            .rect_filled(m, 2.0, Color32::from_rgb(40, 210, 130));
+                    }
+                }
+            }
+        } else {
+            self.drag_page = None;
+        }
+
         match action {
             Some(GridAction::Enlarge(i)) => self.open_viewer(i),
             Some(GridAction::Crop(i)) => self.enter_crop(i, ctx),
@@ -884,6 +919,20 @@ impl CbzApp {
             Some(GridAction::Split(i)) => self.enter_split(i, ctx),
             Some(GridAction::Extract(i)) => self.extract_page(i),
             _ => {}
+        }
+    }
+
+    fn move_page_to(&mut self, uid: u64, target: usize) {
+        if let Some(src) = self.pages.iter().position(|p| p.uid == uid) {
+            let mut t = target.min(self.pages.len());
+            let page = self.pages.remove(src);
+            if src < t {
+                t -= 1;
+            }
+            t = t.min(self.pages.len());
+            self.pages.insert(t, page);
+            self.dirty_order = true;
+            self.status = "Page déplacée.".into();
         }
     }
 
@@ -1127,10 +1176,10 @@ impl eframe::App for CbzApp {
 
         // glisser-déposer : un .cbz s'ouvre, une image s'insère à la position du lâcher
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        if hovering {
-            if let Some(p) = ctx.input(|i| i.pointer.latest_pos()) {
-                self.drop_pos = Some(p);
-            }
+        // Suivre la position du curseur en continu (sur X11, hovered_files reste vide
+        // pendant un drag externe, donc on ne peut pas se fier au survol).
+        if let Some(p) = ctx.input(|i| i.pointer.latest_pos()) {
+            self.drop_pos = Some(p);
         }
         let dropped: Vec<(Option<PathBuf>, Option<std::sync::Arc<[u8]>>, String)> = ctx.input(|i| {
             i.raw.dropped_files.iter().map(|f| (f.path.clone(), f.bytes.clone(), f.name.clone())).collect()
@@ -1139,7 +1188,8 @@ impl eframe::App for CbzApp {
             if let Some(p) = dropped.iter().find_map(|(p, _, _)| p.clone().filter(|p| is_cbz_path(p))) {
                 self.open_cbz(p);
             } else if self.path.is_some() && self.crop.is_none() && self.split.is_none() && self.viewer.is_none() {
-                let mut at = self.drop_pos.map(|pos| self.drop_index(pos)).unwrap_or(self.pages.len());
+                let drop_at = ctx.input(|i| i.pointer.interact_pos()).or(self.drop_pos);
+                let mut at = drop_at.map(|pos| self.drop_index(pos)).unwrap_or(self.pages.len());
                 let mut count = 0;
                 for (path, bytes, name) in &dropped {
                     let ext = path
