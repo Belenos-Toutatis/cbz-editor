@@ -72,10 +72,19 @@ l'appli avec un vrai `.cbz` (un « smoke test » de 3-4 s suffit à confirmer qu
   car appelées séquentiellement ; capture disjointe des champs de `self`.
 
 ## Publier une version
-1. Bumper `version` dans `Cargo.toml`.
-2. `cargo build --release` ; `cargo deb` ; reconstruire l'AppImage (ci-dessus).
-3. `git commit` + `git push`.
-4. `gh release create vX.Y.Z --title … --notes … <.deb> <.AppImage>`.
+Le `.deb` et l'AppImage sont construits et **attachés à la Release automatiquement** par
+GitHub Actions (`.github/workflows/release.yml`) au **push d'un tag `vX.Y.Z`**.
+1. Bumper `version` dans `Cargo.toml` ; `git commit` + `git push`.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z` → la CI compile et publie la Release
+   (notes auto-générées, éditables ensuite ; pour la rendre brouillon, ajouter `draft: true`
+   au step `softprops/action-gh-release`).
+
+Détails CI : runner Ubuntu, build `--locked`, `.deb` via `cargo-deb` (`--no-build`), AppImage via
+linuxdeploy/appimagetool **téléchargés** (le `.aitools/` local n'est pas versionné), nom de sortie
+forcé par `OUTPUT=cbz-editor-x86_64.AppImage`, `APPIMAGE_EXTRACT_AND_RUN=1` (pas de FUSE).
+Les **binaires ne sont jamais commités** (cf. `.gitignore`), seulement attachés à la Release.
+
+Build local (essais) : `cargo deb` + la commande AppImage ci-dessus (outils dans `.aitools/`).
 
 **Confidentialité** : l'e-mail des commits est l'e-mail *noreply* GitHub, fixé en **config locale
 au dépôt** (`git config user.email` local). Ne pas remettre d'e-mail personnel dans les fichiers

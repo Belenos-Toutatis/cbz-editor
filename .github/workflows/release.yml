@@ -1,0 +1,65 @@
+name: Release
+
+# Construit le .deb et l'AppImage puis les attache à la Release,
+# automatiquement au push d'un tag de version (ex. v0.4.0).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # nécessaire pour créer/mettre à jour la Release
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chaîne d'outils Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Dépendances système (build eframe/egui sous X11)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Paquet .deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo deb --no-build
+
+      - name: AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1" # pas de FUSE sur les runners
+          OUTPUT: cbz-editor-x86_64.AppImage # nom de sortie imposé
+        run: |
+          mkdir -p tools
+          curl -fsSL -o tools/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o tools/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x tools/linuxdeploy tools/appimagetool
+          export PATH="$PWD/tools:$PATH"
+          rm -rf AppDir
+          linuxdeploy --appdir AppDir -e target/release/cbz-editor \
+            -d assets/cbz-editor-appimage.desktop -i assets/icon-256.png \
+            --icon-filename cbz-editor --output appimage
+
+      - name: Publier la Release (assets attachés)
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            target/debian/*.deb
+            cbz-editor-x86_64.AppImage
