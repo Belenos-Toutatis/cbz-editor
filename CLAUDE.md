@@ -29,6 +29,14 @@ l'appli avec un vrai `.cbz` (un « smoke test » de 3-4 s suffit à confirmer qu
 - `Page { name, bytes, thumb, delete, uid }`. Le `uid` (stable) sert d'identité pour les
   miniatures et le glisser-réordonner (pas l'index, qui bouge).
 - Miniatures générées **paresseusement** (quota par frame) pour ne pas figer l'UI.
+- **i18n** : toutes les chaînes d'UI passent par `tr(lang, T::Clé)` — table `Lang` × `T` indexée
+  par `lang as usize` (5 colonnes : FR, EN, ES, DE, IT, **dans cet ordre**). `Lang::detect()` lit
+  la locale (`LC_ALL`/`LC_MESSAGES`/`LANG`, repli EN) ; choix mémorisé via `save_lang`/`load_lang`
+  (`~/.config/cbz-editor/lang`) ; sélecteur (ComboBox) dans la barre du haut. Les marqueurs
+  `{n}` `{e}` `{name}`… sont remplacés à l'usage (`.replace`). **Ajouter une chaîne** = une variante
+  `T` + une ligne dans `tr` avec **5** entrées. Pièges d'emprunt : les méthodes UI captent
+  `let lang = self.lang;` en tête (car `self.split/crop/viewer` ou `self.pages.iter_mut()` sont
+  empruntés pendant l'affichage → on ne peut pas rappeler `&self`).
 
 ## Pièges / décisions importantes
 - **Dialogue de fichiers** : `rfd` en backend **`xdg-portal` + `async-std`** (PAS `gtk3`).
@@ -59,7 +67,7 @@ l'appli avec un vrai `.cbz` (un « smoke test » de 3-4 s suffit à confirmer qu
   existante (suffixe `(édité 2)`…). `encode_jpeg` remonte ses erreurs (pas de page vide silencieuse).
 - **Sens de lecture** (`rtl`) déduit du `ComicInfo` (`YesAndRightToLeft`), modifiable dans l'UI ;
   il pilote l'ordre des fusion/découpe.
-- `last_dir` persisté dans `~/.config/cbz-editor/last_dir`.
+- `last_dir` et la langue persistés dans `~/.config/cbz-editor/` (`last_dir`, `lang`).
 - egui : closures imbriquées qui écrivent une variable locale (`action`, `dragged_uid`…) — ok
   car appelées séquentiellement ; capture disjointe des champs de `self`.
 
@@ -74,5 +82,11 @@ au dépôt** (`git config user.email` local). Ne pas remettre d'e-mail personnel
 versionnés ni dans `Cargo.toml` (`maintainer`).
 
 ## Conventions
-- Interface et commentaires en **français**.
+- **Commentaires** et noms de symboles en **français** ; **interface multilingue** (FR/EN/ES/DE/IT)
+  via la table `tr` (voir « i18n » plus haut).
+- **README par langue** : `README.md` (FR, primaire) + `README.en.md` / `README.es.md` /
+  `README.de.md` / `README.it.md`. Garder la **ligne de navigation** en tête de chaque fichier
+  synchronisée, et refléter tout changement de fonctionnalités dans les 5.
+- Fichiers `.desktop` (`assets/`) : champs `Name[xx]` / `GenericName[xx]` / `Comment[xx]` localisés.
+  Le **défaut (non suffixé) reste en français** — le nom de sortie de l'AppImage en dépend.
 - `.gitignore` exclut `target/`, `AppDir/`, `.aitools/`, `*.AppImage`, `*.deb`.

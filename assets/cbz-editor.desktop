@@ -1,8 +1,20 @@
 [Desktop Entry]
 Type=Application
 Name=Éditeur CBZ
+Name[en]=CBZ Editor
+Name[es]=Editor CBZ
+Name[de]=CBZ-Editor
+Name[it]=Editor CBZ
 GenericName=Éditeur de bandes dessinées
+GenericName[en]=Comic Book Editor
+GenericName[es]=Editor de cómics
+GenericName[de]=Comic-Editor
+GenericName[it]=Editor di fumetti
 Comment=Supprimer/réordonner des pages, fusionner/découper des doubles-pages et recadrer la couverture d'un CBZ
+Comment[en]=Delete/reorder pages, merge/split double pages and crop the cover of a CBZ
+Comment[es]=Eliminar/reordenar páginas, fusionar/dividir páginas dobles y recortar la portada de un CBZ
+Comment[de]=Seiten löschen/umordnen, Doppelseiten zusammenführen/teilen und das Cover einer CBZ zuschneiden
+Comment[it]=Elimina/riordina pagine, unisci/dividi pagine doppie e ritaglia la copertina di un CBZ
 Exec=/usr/bin/cbz-editor %f
 Icon=cbz-editor
 Terminal=false
