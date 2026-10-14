@@ -35,6 +35,11 @@ pas la fenêtre XWayland. Dans Xvfb : `xdotool windowfocus` avant les touches, e
 - `Page { name, bytes: Arc<[u8]>, thumb, failed, delete, uid }` (`Clone` bon marché : octets
   partagés). Le `uid` (stable) sert d'identité pour les miniatures, le glisser-réordonner et la
   resynchronisation après écrasement (pas l'index, qui bouge). Nouveaux uid via `new_uid()`.
+- **Rien de lourd sur le thread de l'UI** : ouverture d'un .cbz (`open_cbz` lance `read_cbz`
+  via `spawn_job`, `poll_opening` applique le résultat ; indicateur de progression, UI en lecture
+  seule pendant ce temps) et page agrandie (`ViewerState::pump` décode la page courante puis la
+  suivante/précédente, cache limité à ces 3 pages par uid). Seuls restent synchrones les
+  traitements ponctuels déclenchés par un clic (entrée en recadrage/découpe, fusion, enregistrement).
 - Miniatures décodées **en arrière-plan** (`ThumbWorkers` : 1-4 threads, canaux mpsc) ; l'UI ne fait
   que téléverser la texture. `generation` (incrémentée à l'ouverture) invalide les travaux d'un
   fichier précédent ; `thumb_pending` évite les doublons d'envoi.
@@ -93,8 +98,9 @@ pas la fenêtre XWayland. Dans Xvfb : `xdotool windowfocus` avant les touches, e
   Après « Écraser », `sync_after_overwrite` aligne l'état mémoire sur le fichier écrit (pages
   supprimées retirées, noms définitifs, couverture devenue page 1). Écritures avec `fsync`. Écriture
   **atomique** (.tmp puis rename) + `.bak`. « Enregistrer une copie » n'écrase jamais une copie
-  existante (suffixe `(édité 2)`…). `encode_jpeg` remonte ses erreurs (pas de page vide silencieuse) et aplatit
-  la transparence sur blanc. Lecture : entrées `__MACOSX/` et `._*` ignorées.
+  existante (suffixe `(édité 2)`…). Fusion/découpe/recadrage passent par `encode_page` : **PNG** si
+  toutes les sources sont sans perte (`is_lossless` : PNG/BMP/GIF), sinon JPEG q92 (`encode_jpeg`,
+  qui remonte ses erreurs et aplatit la transparence sur blanc). L'extension suit (`Cover.ext`). Lecture : entrées `__MACOSX/` et `._*` ignorées.
 - **Sens de lecture** (`rtl`) déduit du `ComicInfo` (`YesAndRightToLeft`), modifiable dans l'UI ;
   il pilote l'ordre des fusion/découpe.
 - `last_dir` et la langue persistés dans `~/.config/cbz-editor/` (`last_dir`, `lang`).

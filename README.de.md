@@ -11,7 +11,7 @@ Ein grafischer Editor für **CBZ**-Dateien (Comics / Manga), geschrieben in Rust
 ## Funktionen
 
 - 🗑️ Seiten **löschen** · 🔀 **umordnen** (Schaltflächen oder ein Vorschaubild mit Markierung an seinen Platz **ziehen**) · ➕ ein Bild **einfügen** (Rechtsklick oder **Drag-and-drop** auf das Raster).
-- 🪓 Eine Doppelseite in zwei **teilen** (**verschiebbare** Schnittlinie, **RTL/LTR**-Richtung) · 🔗 zwei Seiten zu einer Doppelseite **zusammenführen**.
+- 🪓 Eine Doppelseite in zwei **teilen** (**verschiebbare** Schnittlinie, **RTL/LTR**-Richtung) · 🔗 zwei Seiten zu einer Doppelseite **zusammenführen**. Eine **PNG-Seite bleibt PNG** (verlustfrei), ein JPEG bleibt JPEG.
 - 🧹 **Duplikate markieren**: markiert Seiten mit **identischem Inhalt** (Bytes) mit einem Klick zum Löschen.
 - ✂️ Eine Seite als **Cover** **zuschneiden** (`000_cover.jpg`), verschiebbarer/größenveränderbarer Rahmen.
 - 🔍 Eine Seite **vergrößern** (Pfeiltasten zum Blättern, **Klick = Originalgröße**, Esc zum Zurück) · 💾 eine Seite in eine Datei **extrahieren**.

@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::io::{Cursor, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{mpsc, Arc, Mutex};
 
 // Durée d'affichage du petit message éphémère (« toast ») après un dépôt d'image.
@@ -20,6 +21,8 @@ const UNDO_MAX: usize = 100;
 // Taille maximale (px) des miniatures de la grille.
 const THUMB_W: u32 = 220;
 const THUMB_H: u32 = 320;
+// Taille maximale (px) d'une page affichée en grand.
+const VIEWER_MAX: u32 = 2200;
 
 fn main() -> eframe::Result<()> {
     // Forcer X11/XWayland : le glisser-déposer de fichiers y est fiable.
@@ -46,6 +49,7 @@ fn main() -> eframe::Result<()> {
                 lang,
                 last_dir: load_last_dir(),
                 thumbs: Some(ThumbWorkers::start(cc.egui_ctx.clone())),
+                egui_ctx: Some(cc.egui_ctx.clone()),
                 ..Default::default()
             };
             if let Some(p) = arg {
@@ -86,6 +90,7 @@ impl Page {
 #[derive(Clone)]
 struct Cover {
     bytes: Arc<[u8]>,
+    ext: &'static str, // « png » si la source était sans perte, sinon « jpg »
     tex: TextureHandle,
     id: u64,
 }
@@ -245,6 +250,7 @@ enum DragKind {
 struct CropState {
     idx: usize,
     img: image::DynamicImage,
+    lossless: bool,
     tex: TextureHandle,
     sel: Option<[u32; 4]>,
     drag: Option<DragKind>,
@@ -254,14 +260,88 @@ struct CropState {
 
 struct ViewerState {
     idx: usize,
-    tex: Option<TextureHandle>,
+    tex: Option<TextureHandle>, // page courante (recalculée par `pump`)
     failed: bool,
     zoom: bool, // taille réelle (sinon : ajusté à la fenêtre)
+    // Pages décodées (courante, suivante, précédente) par uid ; None = illisible.
+    cache: Vec<(u64, Option<TextureHandle>)>,
+    jobs: Vec<(u64, mpsc::Receiver<Option<ColorImage>>)>,
+}
+
+impl ViewerState {
+    // Décode en arrière-plan la page courante PUIS ses voisines (feuilletage instantané),
+    // et ne garde en mémoire que ces trois pages.
+    fn pump(&mut self, ctx: &egui::Context, pages: &[Page]) {
+        let cur = pages.get(self.idx).map(|p| p.uid);
+        let wanted: Vec<u64> = [
+            Some(self.idx),
+            self.idx.checked_add(1),
+            self.idx.checked_sub(1),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|i| pages.get(i).map(|p| p.uid))
+        .collect();
+        let mut i = 0;
+        while i < self.jobs.len() {
+            match self.jobs[i].1.try_recv() {
+                Ok(img) => {
+                    let uid = self.jobs.remove(i).0;
+                    let tex = img.map(|ci| {
+                        ctx.load_texture(format!("viewer-{uid}"), ci, TextureOptions::LINEAR)
+                    });
+                    self.cache.push((uid, tex));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let uid = self.jobs.remove(i).0;
+                    self.cache.push((uid, None));
+                }
+                Err(TryRecvError::Empty) => i += 1,
+            }
+        }
+        self.cache.retain(|(u, _)| wanted.contains(u));
+        self.jobs.retain(|(u, _)| wanted.contains(u));
+        for &uid in &wanted {
+            if self.cache.iter().any(|c| c.0 == uid) || self.jobs.iter().any(|j| j.0 == uid) {
+                continue;
+            }
+            if let Some(p) = pages.iter().find(|p| p.uid == uid) {
+                let bytes = p.bytes.clone();
+                let rx = spawn_job(Some(ctx.clone()), move || {
+                    decode_color_image(&bytes, VIEWER_MAX)
+                });
+                self.jobs.push((uid, rx));
+            }
+        }
+        match cur.and_then(|u| self.cache.iter().find(|c| c.0 == u)) {
+            Some((_, t)) => {
+                self.tex = t.clone();
+                self.failed = t.is_none();
+            }
+            None => {
+                self.tex = None;
+                self.failed = false;
+            }
+        }
+    }
+}
+
+// Résultat de la lecture d'une archive : pages + ComicInfo éventuel.
+type ReadResult = Result<(Vec<Page>, Option<Vec<u8>>), String>;
+
+// Ouverture d'un .cbz en cours : lue dans un thread pour ne pas figer la fenêtre
+// (une archive de plusieurs centaines de Mo prend quelques secondes).
+struct Opening {
+    path: PathBuf,
+    rx: mpsc::Receiver<ReadResult>,
+    done: Arc<AtomicU64>,  // entrées lues…
+    total: Arc<AtomicU64>, // …sur le nombre d'entrées de l'archive
 }
 
 struct SplitState {
     idx: usize,
     img: image::DynamicImage,
+    lossless: bool,
     tex: TextureHandle,
     cut: u32, // position de coupe en pixels image
     rtl: bool,
@@ -313,6 +393,8 @@ struct CbzApp {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     thumbs: Option<ThumbWorkers>,
+    egui_ctx: Option<egui::Context>,
+    opening: Option<Opening>,
     thumb_pending: HashSet<u64>,
     window_title: String,
     card_rects: Vec<(usize, Rect)>,
@@ -404,6 +486,9 @@ impl CbzApp {
     // Ouvre un fichier (ou le dialogue si `None`) après confirmation s'il reste
     // des modifications non enregistrées.
     fn request_open(&mut self, path: Option<PathBuf>) {
+        if self.opening.is_some() {
+            return;
+        }
         if self.is_modified() {
             self.confirm_discard = Some(Pending::Open(path));
         } else {
@@ -418,9 +503,51 @@ impl CbzApp {
         }
     }
 
+    // Lance la lecture en arrière-plan ; `poll_opening` applique le résultat.
     fn open_cbz(&mut self, path: PathBuf) {
+        if self.opening.is_some() {
+            return;
+        }
         let lang = self.lang;
-        match Self::read_cbz(&path, lang) {
+        let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let (d, t, p, ctx) = (
+            done.clone(),
+            total.clone(),
+            path.clone(),
+            self.egui_ctx.clone(),
+        );
+        let rx = spawn_job(self.egui_ctx.clone(), move || {
+            Self::read_cbz(&p, lang, &|i, n| {
+                d.store(i, AtomicOrdering::Relaxed);
+                t.store(n, AtomicOrdering::Relaxed);
+                if let Some(c) = &ctx {
+                    c.request_repaint();
+                }
+            })
+        });
+        self.opening = Some(Opening {
+            path,
+            rx,
+            done,
+            total,
+        });
+    }
+
+    fn poll_opening(&mut self) {
+        let Some(op) = &self.opening else { return };
+        let res = match op.rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(tr(self.lang, T::Interrupted).to_string()),
+        };
+        if let Some(op) = self.opening.take() {
+            self.apply_open(op.path, res);
+        }
+    }
+
+    fn apply_open(&mut self, path: PathBuf, res: ReadResult) {
+        let lang = self.lang;
+        match res {
             Ok((mut pages, ci)) => {
                 self.generation += 1;
                 if let Some(t) = &self.thumbs {
@@ -623,7 +750,8 @@ impl CbzApp {
         groups
     }
 
-    fn read_cbz(path: &Path, lang: Lang) -> Result<(Vec<Page>, Option<Vec<u8>>), String> {
+    // `progress(lues, total)` est appelé après chaque entrée de l'archive.
+    fn read_cbz(path: &Path, lang: Lang, progress: &dyn Fn(u64, u64)) -> ReadResult {
         // Garde-fous anti « bombe zip » : on borne la taille décompressée lue, par
         // entrée et au total, pour ne pas saturer la mémoire avec un fichier piégé.
         const MAX_ENTRY: u64 = 512 * 1024 * 1024;
@@ -634,7 +762,9 @@ impl CbzApp {
         let mut ci: Option<Vec<u8>> = None;
         let mut ci_is_comicinfo = false;
         let mut total: u64 = 0;
+        let n_entries = z.len() as u64;
         for i in 0..z.len() {
+            progress(i as u64, n_entries);
             let mut e = z.by_index(i).map_err(|e| e.to_string())?;
             if e.is_dir() {
                 continue;
@@ -678,6 +808,7 @@ impl CbzApp {
                 pages.push(Page::new(name, buf.into(), 0));
             }
         }
+        progress(n_entries, n_entries);
         // Tri « naturel » : page2 < page10 (un tri lexical donnerait page10 < page2).
         pages.sort_by(|a, b| natural_cmp(&a.name, &b.name));
         Ok((pages, ci))
@@ -723,6 +854,8 @@ impl CbzApp {
             tex: None,
             failed: false,
             zoom,
+            cache: Vec::new(),
+            jobs: Vec::new(),
         });
     }
 
@@ -784,6 +917,7 @@ impl CbzApp {
         let Some(page) = self.pages.get(idx) else {
             return;
         };
+        let lossless = is_lossless(&page.bytes);
         match image::load_from_memory(&page.bytes) {
             Ok(img) => {
                 let disp = display_copy(&img, 1600);
@@ -796,6 +930,7 @@ impl CbzApp {
                 self.crop = Some(CropState {
                     idx,
                     img,
+                    lossless,
                     tex,
                     sel: None,
                     drag: None,
@@ -819,7 +954,7 @@ impl CbzApp {
             self.crop = Some(cs);
             return;
         };
-        let bytes = match encode_jpeg(&cropped, 92) {
+        let (bytes, ext) = match encode_page(&cropped, cs.lossless) {
             Ok(b) => b,
             Err(e) => {
                 self.fail(tr(self.lang, T::CoverEncodeError).replace("{e}", &e));
@@ -838,6 +973,7 @@ impl CbzApp {
         self.checkpoint();
         self.cover = Some(Cover {
             bytes: bytes.into(),
+            ext,
             tex,
             id,
         });
@@ -890,7 +1026,8 @@ impl CbzApp {
         // a est lue en 1er, b en 2e. En RTL : a à droite, b à gauche.
         let (left, right) = if self.rtl { (b, a) } else { (a, b) };
         let merged = concat_h(left, right);
-        let bytes = match encode_jpeg(&merged, 92) {
+        let lossless = is_lossless(&self.pages[i].bytes) && is_lossless(&self.pages[i + 1].bytes);
+        let (bytes, ext) = match encode_page(&merged, lossless) {
             Ok(b) => b,
             Err(e) => {
                 self.fail(tr(lang, T::MergeEncodeError).replace("{e}", &e));
@@ -899,7 +1036,7 @@ impl CbzApp {
         };
         self.checkpoint();
         let uid = self.new_uid();
-        self.pages[i] = Page::new(format!("merged-{uid}.jpg"), bytes.into(), uid);
+        self.pages[i] = Page::new(format!("merged-{uid}.{ext}"), bytes.into(), uid);
         self.pages.remove(i + 1);
         self.dirty_order = true;
         self.info(tr(lang, T::Merged));
@@ -909,6 +1046,7 @@ impl CbzApp {
         let Some(page) = self.pages.get(idx) else {
             return;
         };
+        let lossless = is_lossless(&page.bytes);
         match image::load_from_memory(&page.bytes) {
             Ok(img) => {
                 if img.width() < 2 {
@@ -925,6 +1063,7 @@ impl CbzApp {
                 let cut = img.width() / 2;
                 self.split = Some(SplitState {
                     idx,
+                    lossless,
                     cut,
                     rtl: self.rtl,
                     img,
@@ -947,8 +1086,11 @@ impl CbzApp {
         let left = ss.img.crop_imm(0, 0, cut, ss.img.height());
         let right = ss.img.crop_imm(cut, 0, w - cut, ss.img.height());
         let (first, second) = if ss.rtl { (right, left) } else { (left, right) };
-        let (fb, sb) = match (encode_jpeg(&first, 92), encode_jpeg(&second, 92)) {
-            (Ok(f), Ok(s)) => (f, s),
+        let (fb, sb, ext) = match (
+            encode_page(&first, ss.lossless),
+            encode_page(&second, ss.lossless),
+        ) {
+            (Ok((f, ext)), Ok((s, _))) => (f, s, ext),
             _ => {
                 self.fail(tr(self.lang, T::SplitEncodeError));
                 self.split = Some(ss);
@@ -959,10 +1101,14 @@ impl CbzApp {
             self.checkpoint();
             let (u1, u2) = (self.new_uid(), self.new_uid());
             self.pages.remove(ss.idx);
-            self.pages
-                .insert(ss.idx, Page::new(format!("split-{u2}.jpg"), sb.into(), u2));
-            self.pages
-                .insert(ss.idx, Page::new(format!("split-{u1}.jpg"), fb.into(), u1));
+            self.pages.insert(
+                ss.idx,
+                Page::new(format!("split-{u2}.{ext}"), sb.into(), u2),
+            );
+            self.pages.insert(
+                ss.idx,
+                Page::new(format!("split-{u1}.{ext}"), fb.into(), u1),
+            );
             self.dirty_order = true;
             self.info(tr(self.lang, T::SplitDone));
         }
@@ -1124,7 +1270,7 @@ impl CbzApp {
             .position(|p| !p.delete && is_cover_name(&p.name));
         let (cover_bytes, cover_uid, cover_ext): (Option<Arc<[u8]>>, Option<u64>, String) =
             match (&self.cover, old_cover) {
-                (Some(c), _) => (Some(c.bytes.clone()), None, "jpg".into()),
+                (Some(c), _) => (Some(c.bytes.clone()), None, c.ext.to_string()),
                 (None, Some(i)) => (
                     Some(self.pages[i].bytes.clone()),
                     Some(self.pages[i].uid),
@@ -1869,14 +2015,7 @@ impl CbzApp {
         let lang = self.lang;
         let pal = pal(ctx);
         if let Some(vs) = self.viewer.as_mut() {
-            if vs.tex.is_none() && !vs.failed {
-                if let Some(page) = self.pages.get(vs.idx) {
-                    match decode_texture(ctx, &page.bytes, 2200) {
-                        Some(t) => vs.tex = Some(t),
-                        None => vs.failed = true,
-                    }
-                }
-            }
+            vs.pump(ctx, &self.pages);
             let idx = vs.idx;
             let total = self.pages.len();
             let (name, is_del) = self
@@ -2442,7 +2581,10 @@ impl eframe::App for CbzApp {
             self.confirm_discard = Some(Pending::Quit);
         }
 
-        let modal = self.confirm_overwrite || self.confirm_discard.is_some();
+        self.poll_opening();
+        // Pendant une ouverture, l'interface est en lecture seule (comme sous une boîte).
+        let modal =
+            self.confirm_overwrite || self.confirm_discard.is_some() || self.opening.is_some();
         if !modal {
             self.handle_keys(ctx);
             self.handle_drops(ctx, now);
@@ -2502,7 +2644,7 @@ impl eframe::App for CbzApp {
                 self.crop_ui(ui, ctx);
             } else if self.path.is_some() {
                 self.grid_ui(ui, ctx);
-            } else {
+            } else if self.opening.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label(RichText::new(tr(lang, T::EmptyState)).size(20.0).weak());
                 });
@@ -2546,6 +2688,33 @@ impl eframe::App for CbzApp {
         }
 
         self.dialogs_ui(ctx);
+
+        // Indicateur d'ouverture en cours (lecture de l'archive en arrière-plan).
+        if let Some(op) = &self.opening {
+            let name = op
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let txt = tr(lang, T::OpeningProgress)
+                .replace("{name}", &name)
+                .replace("{done}", &op.done.load(AtomicOrdering::Relaxed).to_string())
+                .replace(
+                    "{total}",
+                    &op.total.load(AtomicOrdering::Relaxed).to_string(),
+                );
+            egui::Area::new(Id::new("opening"))
+                .order(Order::Foreground)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.label(txt);
+                        });
+                    });
+                });
+        }
 
         // Petit message éphémère qui disparaît tout seul (≈ TOAST_SECS secondes).
         if let Some((msg, exp)) = self.toast.clone() {
@@ -2677,19 +2846,31 @@ fn resize_cursor(h: Handle) -> CursorIcon {
 
 // ---------- utilitaires ----------
 
-fn decode_texture(ctx: &egui::Context, bytes: &[u8], max: u32) -> Option<TextureHandle> {
+// Décode une page pour l'affichage (réduite si une dimension dépasse `max`).
+// Appelée hors du thread de l'UI.
+fn decode_color_image(bytes: &[u8], max: u32) -> Option<ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
-    let img = if img.width() > max || img.height() > max {
-        img.thumbnail(max, max)
-    } else {
-        img
-    };
+    let img = display_copy(&img, max);
     let rgba = img.to_rgba8();
-    let ci = ColorImage::from_rgba_unmultiplied(
+    Some(ColorImage::from_rgba_unmultiplied(
         [img.width() as usize, img.height() as usize],
         rgba.as_raw(),
-    );
-    Some(ctx.load_texture("viewer", ci, TextureOptions::LINEAR))
+    ))
+}
+
+// Lance `f` dans un thread ; le résultat arrive par le canal et l'UI est réveillée.
+fn spawn_job<T: Send + 'static>(
+    ctx: Option<egui::Context>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> mpsc::Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+        if let Some(c) = ctx {
+            c.request_repaint();
+        }
+    });
+    rx
 }
 
 fn fit(size: [usize; 2], max: Vec2) -> Vec2 {
@@ -2889,6 +3070,8 @@ enum T {
     DiscardLine,
     DiscardYes,
     SaveCopyFirst,
+    Interrupted,
+    OpeningProgress,
 }
 
 fn tr(lang: Lang, key: T) -> &'static str {
@@ -3029,6 +3212,8 @@ fn tr(lang: Lang, key: T) -> &'static str {
         T::DiscardLine => ["Les modifications en cours seront perdues.", "Your current changes will be lost.", "Se perderán los cambios actuales.", "Die aktuellen Änderungen gehen verloren.", "Le modifiche in corso andranno perse."][i],
         T::DiscardYes => ["Abandonner les modifications", "Discard changes", "Descartar los cambios", "Änderungen verwerfen", "Scarta le modifiche"][i],
         T::SaveCopyFirst => ["💾 Enregistrer une copie d'abord", "💾 Save a copy first", "💾 Guardar una copia primero", "💾 Zuerst eine Kopie speichern", "💾 Salva prima una copia"][i],
+        T::Interrupted => ["lecture interrompue (erreur interne).", "reading interrupted (internal error).", "lectura interrumpida (error interno).", "Lesen abgebrochen (interner Fehler).", "lettura interrotta (errore interno)."][i],
+        T::OpeningProgress => ["Ouverture de « {name} »… {done} / {total}", "Opening “{name}”… {done} / {total}", "Abriendo «{name}»… {done} / {total}", "„{name}“ wird geöffnet… {done} / {total}", "Apertura di «{name}»… {done} / {total}"][i],
     }
 }
 
@@ -3119,6 +3304,30 @@ fn short_name(name: &str) -> String {
         format!("…{tail}")
     } else {
         base.to_string()
+    }
+}
+
+// Source sans perte (PNG, BMP, GIF) : une image recalculée à partir d'elle reste
+// en PNG. Sinon JPEG q92 : on ne dégrade pas un PNG, et on n'alourdit pas un JPEG.
+fn is_lossless(bytes: &[u8]) -> bool {
+    matches!(
+        image::guess_format(bytes),
+        Ok(image::ImageFormat::Png | image::ImageFormat::Bmp | image::ImageFormat::Gif)
+    )
+}
+
+// Encode une page recalculée ; renvoie les octets et l'extension à utiliser.
+fn encode_page(
+    img: &image::DynamicImage,
+    lossless: bool,
+) -> Result<(Vec<u8>, &'static str), String> {
+    if lossless {
+        let mut out = Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+        Ok((out.into_inner(), "png"))
+    } else {
+        encode_jpeg(img, 92).map(|b| (b, "jpg"))
     }
 }
 
@@ -3424,6 +3633,7 @@ mod tests {
             TextureOptions::LINEAR,
         );
         a.cover = Some(Cover {
+            ext: "jpg",
             bytes: png(1, 1, [0, 0, 0, 255]),
             tex,
             id: 99,
@@ -3499,7 +3709,7 @@ mod tests {
             }
             zw.finish().unwrap();
         }
-        let (pages, ci) = CbzApp::read_cbz(&path, Lang::Fr).unwrap();
+        let (pages, ci) = CbzApp::read_cbz(&path, Lang::Fr, &|_, _| {}).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let n: Vec<_> = pages.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(n, ["p2.jpg", "p10.jpg"]);
@@ -3513,6 +3723,98 @@ mod tests {
             .unwrap()
             .to_rgb8();
         assert!(back.get_pixel(1, 1).0.iter().all(|&c| c > 240));
+    }
+
+    fn jpeg(w: u32, h: u32) -> Arc<[u8]> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            w,
+            h,
+            image::Rgb([9, 9, 9]),
+        ));
+        encode_jpeg(&img, 92).unwrap().into()
+    }
+
+    #[test]
+    fn fusion_garde_le_png_sans_perte() {
+        let mut a = app(&["1.png", "2.png"], None);
+        a.merge_next(0);
+        assert!(a.pages[0].name.ends_with(".png"));
+        assert_eq!(
+            image::guess_format(&a.pages[0].bytes).unwrap(),
+            image::ImageFormat::Png
+        );
+    }
+
+    #[test]
+    fn fusion_jpeg_reste_jpeg() {
+        let mut a = app(&["1.jpg", "2.jpg"], None);
+        a.pages[0].bytes = jpeg(4, 4);
+        a.merge_next(0);
+        assert!(a.pages[0].name.ends_with(".jpg"));
+        assert_eq!(
+            image::guess_format(&a.pages[0].bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
+    }
+
+    #[test]
+    fn ouverture_en_arriere_plan() {
+        let dir = std::env::temp_dir().join(format!("cbz-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.cbz");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for n in ["b.png", "a.png"] {
+                zw.start_file(n, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zw.write_all(&png(2, 2, [1, 2, 3, 255])).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let mut a = CbzApp::default();
+        a.open_cbz(path.clone());
+        for _ in 0..500 {
+            a.poll_opening();
+            if a.opening.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(a.opening.is_none());
+        assert_eq!(a.path.as_deref(), Some(path.as_path()));
+        let n: Vec<_> = a.pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(n, ["a.png", "b.png"]);
+    }
+
+    #[test]
+    fn agrandissement_precharge_les_voisines() {
+        let a = app(&["1.png", "2.png", "3.png", "4.png"], None);
+        let ctx = egui::Context::default();
+        let mut vs = ViewerState {
+            idx: 1,
+            tex: None,
+            failed: false,
+            zoom: false,
+            cache: Vec::new(),
+            jobs: Vec::new(),
+        };
+        for _ in 0..500 {
+            vs.pump(&ctx, &a.pages);
+            if vs.jobs.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(vs.tex.is_some() && !vs.failed);
+        let mut uids: Vec<u64> = vs.cache.iter().map(|c| c.0).collect();
+        uids.sort();
+        assert_eq!(uids, [0, 1, 2]); // précédente, courante, suivante
+                                     // Page suivante : déjà prête, et la page 0 sort du cache.
+        vs.idx = 2;
+        vs.pump(&ctx, &a.pages);
+        assert!(vs.tex.is_some());
+        assert!(!vs.cache.iter().any(|c| c.0 == 0));
     }
 
     #[test]

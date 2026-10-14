@@ -11,7 +11,7 @@
 ## Fonctionnalités
 
 - 🗑️ **Supprimer** des pages · 🔀 **réordonner** (boutons, ou **glisser** une vignette à sa place avec repère) · ➕ **insérer** une image (clic droit, ou **glisser-déposer** sur la grille).
-- 🪓 **Découper** une double-page en deux (ligne de coupe **déplaçable**, sens **RTL/LTR**) · 🔗 **fusionner** deux pages en double-page.
+- 🪓 **Découper** une double-page en deux (ligne de coupe **déplaçable**, sens **RTL/LTR**) · 🔗 **fusionner** deux pages en double-page. Une page **PNG reste en PNG** (sans perte), un JPEG reste en JPEG.
 - 🧹 **Marquer les doublons** : coche pour suppression les pages au **contenu identique** (octets) en un clic.
 - ✂️ **Recadrer** une page en **couverture** (`000_cover.jpg`), cadre déplaçable/redimensionnable.
 - 🔍 **Agrandir** une page (flèches pour feuilleter, **clic = taille réelle**, Échap pour revenir) · 💾 **extraire** une page vers un fichier.

@@ -11,7 +11,7 @@ Editor grafico di file **CBZ** (fumetti / manga), scritto in Rust con
 ## Funzionalità
 
 - 🗑️ **Eliminare** pagine · 🔀 **riordinare** (pulsanti, o **trascinare** una miniatura al suo posto con un indicatore) · ➕ **inserire** un'immagine (clic destro, o **trascina e rilascia** sulla griglia).
-- 🪓 **Dividere** una pagina doppia in due (linea di taglio **spostabile**, senso **RTL/LTR**) · 🔗 **unire** due pagine in una pagina doppia.
+- 🪓 **Dividere** una pagina doppia in due (linea di taglio **spostabile**, senso **RTL/LTR**) · 🔗 **unire** due pagine in una pagina doppia. Una pagina **PNG resta PNG** (senza perdita), un JPEG resta JPEG.
 - 🧹 **Segnare i doppioni**: seleziona per l'eliminazione le pagine con **contenuto identico** (byte) in un clic.
 - ✂️ **Ritagliare** una pagina come **copertina** (`000_cover.jpg`), riquadro spostabile/ridimensionabile.
 - 🔍 **Ingrandire** una pagina (frecce per sfogliare, **clic = dimensione reale**, Esc per tornare) · 💾 **estrarre** una pagina in un file.

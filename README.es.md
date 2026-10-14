@@ -11,7 +11,7 @@ Editor gráfico de archivos **CBZ** (cómics / manga), escrito en Rust con
 ## Funciones
 
 - 🗑️ **Eliminar** páginas · 🔀 **reordenar** (botones, o **arrastrar** una miniatura a su sitio con un marcador) · ➕ **insertar** una imagen (clic derecho, o **arrastrar y soltar** en la cuadrícula).
-- 🪓 **Dividir** una página doble en dos (línea de corte **desplazable**, sentido **RTL/LTR**) · 🔗 **fusionar** dos páginas en una página doble.
+- 🪓 **Dividir** una página doble en dos (línea de corte **desplazable**, sentido **RTL/LTR**) · 🔗 **fusionar** dos páginas en una página doble. Una página **PNG sigue en PNG** (sin pérdida), un JPEG sigue en JPEG.
 - 🧹 **Marcar duplicados**: marca para eliminar las páginas con **contenido idéntico** (bytes) en un clic.
 - ✂️ **Recortar** una página como **portada** (`000_cover.jpg`), marco desplazable/redimensionable.
 - 🔍 **Ampliar** una página (flechas para pasar páginas, **clic = tamaño real**, Esc para volver) · 💾 **extraer** una página a un archivo.
