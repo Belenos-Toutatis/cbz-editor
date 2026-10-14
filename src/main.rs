@@ -7,11 +7,19 @@ use egui::{
     Align2, Color32, ColorImage, CursorIcon, FontId, Id, Key, LayerId, Order, Pos2, Rect, RichText,
     Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
+use std::collections::HashSet;
 use std::io::{Cursor, Read, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{mpsc, Arc, Mutex};
 
 // Durée d'affichage du petit message éphémère (« toast ») après un dépôt d'image.
 const TOAST_SECS: f64 = 2.0;
+// Nombre maximal d'étapes mémorisées pour Défaire/Refaire.
+const UNDO_MAX: usize = 100;
+// Taille maximale (px) des miniatures de la grille.
+const THUMB_W: u32 = 220;
+const THUMB_H: u32 = 320;
 
 fn main() -> eframe::Result<()> {
     // Forcer X11/XWayland : le glisser-déposer de fichiers y est fiable.
@@ -24,6 +32,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 820.0])
+            .with_min_inner_size([760.0, 480.0])
             .with_title(tr(lang, T::WindowTitle))
             .with_app_id("cbz-editor")
             .with_icon(load_icon()),
@@ -32,10 +41,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "cbz-editor",
         options,
-        Box::new(move |_cc| {
-            let mut app = CbzApp::default();
-            app.lang = lang;
-            app.last_dir = load_last_dir();
+        Box::new(move |cc| {
+            let mut app = CbzApp {
+                lang,
+                last_dir: load_last_dir(),
+                thumbs: Some(ThumbWorkers::start(cc.egui_ctx.clone())),
+                ..Default::default()
+            };
             if let Some(p) = arg {
                 app.open_cbz(p);
             }
@@ -44,13 +56,171 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+// Les octets sont partagés (`Arc`) : cloner une page (historique Défaire, envoi au
+// décodeur de miniatures) ne recopie jamais l'image.
+#[derive(Clone)]
 struct Page {
     name: String,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     thumb: Option<TextureHandle>,
     failed: bool,
     delete: bool,
     uid: u64,
+}
+
+impl Page {
+    fn new(name: String, bytes: Arc<[u8]>, uid: u64) -> Page {
+        Page {
+            name,
+            bytes,
+            thumb: None,
+            failed: false,
+            delete: false,
+            uid,
+        }
+    }
+}
+
+// Couverture recadrée en attente d'enregistrement (`id` unique : sert à l'empreinte
+// des modifications).
+#[derive(Clone)]
+struct Cover {
+    bytes: Arc<[u8]>,
+    tex: TextureHandle,
+    id: u64,
+}
+
+// État restaurable par Défaire/Refaire.
+#[derive(Clone)]
+struct Snapshot {
+    pages: Vec<Page>,
+    cover: Option<Cover>,
+    dirty_order: bool,
+}
+
+// Action différée derrière la confirmation « modifications non enregistrées ».
+enum Pending {
+    Open(Option<PathBuf>),
+    Quit,
+}
+
+// ---------- décodage des miniatures en arrière-plan ----------
+// Le décodage d'une page (JPEG de plusieurs Mpx) peut prendre des dizaines de ms :
+// fait sur le thread de l'UI, il figeait la fenêtre à l'ouverture. Des threads
+// dédiés décodent ; l'UI ne fait que téléverser la texture (rapide).
+struct ThumbJob {
+    gen: u64,
+    uid: u64,
+    bytes: Arc<[u8]>,
+}
+
+struct ThumbDone {
+    gen: u64,
+    uid: u64,
+    img: Option<ColorImage>,
+}
+
+struct ThumbWorkers {
+    jobs: mpsc::Sender<ThumbJob>,
+    done: mpsc::Receiver<ThumbDone>,
+    // Génération courante : les travaux d'un fichier précédent sont ignorés.
+    gen: Arc<AtomicU64>,
+}
+
+impl ThumbWorkers {
+    fn start(ctx: egui::Context) -> ThumbWorkers {
+        let (job_tx, job_rx) = mpsc::channel::<ThumbJob>();
+        let (done_tx, done_rx) = mpsc::channel::<ThumbDone>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let gen = Arc::new(AtomicU64::new(0));
+        let n = std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .clamp(1, 4);
+        for _ in 0..n {
+            let (job_rx, done_tx, ctx, gen) =
+                (job_rx.clone(), done_tx.clone(), ctx.clone(), gen.clone());
+            std::thread::spawn(move || loop {
+                let job = {
+                    let Ok(rx) = job_rx.lock() else { return };
+                    match rx.recv() {
+                        Ok(j) => j,
+                        Err(_) => return,
+                    }
+                };
+                if job.gen != gen.load(AtomicOrdering::Relaxed) {
+                    continue;
+                }
+                let img = image::load_from_memory(&job.bytes).ok().map(|img| {
+                    let t = img.thumbnail(THUMB_W, THUMB_H);
+                    let rgba = t.to_rgba8();
+                    ColorImage::from_rgba_unmultiplied(
+                        [t.width() as usize, t.height() as usize],
+                        rgba.as_raw(),
+                    )
+                });
+                if done_tx
+                    .send(ThumbDone {
+                        gen: job.gen,
+                        uid: job.uid,
+                        img,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                ctx.request_repaint();
+            });
+        }
+        ThumbWorkers {
+            jobs: job_tx,
+            done: done_rx,
+            gen,
+        }
+    }
+}
+
+// ---------- palette ----------
+// Couleurs centralisées, déclinées pour les thèmes sombre et clair (egui suit le
+// thème du système) : une seule couleur d'accent pour tous les repères.
+#[derive(Clone, Copy)]
+struct Pal {
+    accent: Color32,
+    ok: Color32,
+    warn: Color32,
+    danger: Color32,
+    info: Color32,
+    del_fill: Color32,
+    drag_fill: Color32,
+    bad_fill: Color32,
+    bad_text: Color32,
+}
+
+fn pal(ctx: &egui::Context) -> Pal {
+    if ctx.style().visuals.dark_mode {
+        Pal {
+            accent: Color32::from_rgb(0, 170, 255),
+            ok: Color32::from_rgb(110, 200, 120),
+            warn: Color32::from_rgb(230, 160, 60),
+            danger: Color32::from_rgb(230, 100, 100),
+            info: Color32::from_rgb(150, 150, 220),
+            del_fill: Color32::from_rgb(66, 30, 30),
+            drag_fill: Color32::from_rgb(28, 60, 42),
+            bad_fill: Color32::from_rgb(54, 40, 40),
+            bad_text: Color32::from_rgb(210, 170, 170),
+        }
+    } else {
+        Pal {
+            accent: Color32::from_rgb(0, 120, 215),
+            ok: Color32::from_rgb(30, 130, 50),
+            warn: Color32::from_rgb(185, 105, 0),
+            danger: Color32::from_rgb(190, 40, 40),
+            info: Color32::from_rgb(70, 70, 170),
+            del_fill: Color32::from_rgb(248, 214, 214),
+            drag_fill: Color32::from_rgb(205, 240, 215),
+            bad_fill: Color32::from_rgb(240, 225, 225),
+            bad_text: Color32::from_rgb(150, 60, 60),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -86,6 +256,7 @@ struct ViewerState {
     idx: usize,
     tex: Option<TextureHandle>,
     failed: bool,
+    zoom: bool, // taille réelle (sinon : ajusté à la fenêtre)
 }
 
 struct SplitState {
@@ -96,7 +267,15 @@ struct SplitState {
     rtl: bool,
 }
 
+// Résultat de `build_cbz` : octets de l'archive + (nom écrit, uid source) par image.
+struct Built {
+    data: Vec<u8>,
+    entries: Vec<(String, Option<u64>)>,
+    comicinfo: Option<Vec<u8>>,
+}
+
 enum GridAction {
+    ToggleDelete(usize),
     Enlarge(usize),
     Crop(usize),
     MoveLeft(usize),
@@ -117,7 +296,7 @@ struct CbzApp {
     last_dir: Option<PathBuf>,
     comicinfo: Option<Vec<u8>>,
     pages: Vec<Page>,
-    cover: Option<(Vec<u8>, Option<TextureHandle>)>,
+    cover: Option<Cover>,
     crop: Option<CropState>,
     viewer: Option<ViewerState>,
     split: Option<SplitState>,
@@ -126,7 +305,16 @@ struct CbzApp {
     next_uid: u64,
     dirty_order: bool,
     status: String,
+    status_err: bool,
     confirm_overwrite: bool,
+    confirm_discard: Option<Pending>,
+    allow_close: bool,
+    saved_sig: u64,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    thumbs: Option<ThumbWorkers>,
+    thumb_pending: HashSet<u64>,
+    window_title: String,
     card_rects: Vec<(usize, Rect)>,
     drag_page: Option<u64>,
     toast: Option<(String, f64)>,
@@ -134,11 +322,111 @@ struct CbzApp {
 }
 
 impl CbzApp {
+    // ---------- barre d'état ----------
+    fn info(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        self.status_err = false;
+    }
+
+    fn fail(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        self.status_err = true;
+    }
+
+    // ---------- modifications / Défaire ----------
+    // Empreinte de l'état éditable (ordre, pages cochées, couverture) : comparée à
+    // celle du dernier enregistrement pour savoir s'il reste des modifications.
+    fn edit_sig(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for p in &self.pages {
+            (p.uid, p.delete).hash(&mut h);
+        }
+        self.cover.as_ref().map(|c| c.id).hash(&mut h);
+        h.finish()
+    }
+
+    fn is_modified(&self) -> bool {
+        self.path.is_some() && self.edit_sig() != self.saved_sig
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            pages: self.pages.clone(),
+            cover: self.cover.clone(),
+            dirty_order: self.dirty_order,
+        }
+    }
+
+    // À appeler juste AVANT chaque modification (mémorise l'état pour Défaire).
+    fn checkpoint(&mut self) {
+        self.undo.push(self.snapshot());
+        if self.undo.len() > UNDO_MAX {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.pages = s.pages;
+        self.cover = s.cover;
+        self.dirty_order = s.dirty_order;
+        if let Some(vs) = self.viewer.as_mut() {
+            vs.idx = vs.idx.min(self.pages.len().saturating_sub(1));
+            vs.tex = None;
+            vs.failed = false;
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(s) = self.undo.pop() {
+            self.redo.push(self.snapshot());
+            self.restore(s);
+            self.info(tr(self.lang, T::Undone));
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(s) = self.redo.pop() {
+            self.undo.push(self.snapshot());
+            self.restore(s);
+            self.info(tr(self.lang, T::Redone));
+        }
+    }
+
+    fn new_uid(&mut self) -> u64 {
+        let u = self.next_uid;
+        self.next_uid += 1;
+        u
+    }
+
+    // ---------- ouverture ----------
+    // Ouvre un fichier (ou le dialogue si `None`) après confirmation s'il reste
+    // des modifications non enregistrées.
+    fn request_open(&mut self, path: Option<PathBuf>) {
+        if self.is_modified() {
+            self.confirm_discard = Some(Pending::Open(path));
+        } else {
+            self.do_open(path);
+        }
+    }
+
+    fn do_open(&mut self, path: Option<PathBuf>) {
+        match path {
+            Some(p) => self.open_cbz(p),
+            None => self.open_dialog(),
+        }
+    }
+
     fn open_cbz(&mut self, path: PathBuf) {
         let lang = self.lang;
         match Self::read_cbz(&path, lang) {
             Ok((mut pages, ci)) => {
                 self.generation += 1;
+                if let Some(t) = &self.thumbs {
+                    t.gen.store(self.generation, AtomicOrdering::Relaxed);
+                }
+                self.thumb_pending.clear();
                 for (i, p) in pages.iter_mut().enumerate() {
                     p.uid = i as u64;
                 }
@@ -147,7 +435,7 @@ impl CbzApp {
                 self.pages = pages;
                 self.rtl = ci
                     .as_ref()
-                    .map_or(true, |x| String::from_utf8_lossy(x).contains("RightToLeft"));
+                    .is_none_or(|x| String::from_utf8_lossy(x).contains("RightToLeft"));
                 self.comicinfo = ci;
                 if let Some(parent) = path.parent() {
                     self.last_dir = Some(parent.to_path_buf());
@@ -160,9 +448,12 @@ impl CbzApp {
                 self.split = None;
                 self.dirty_order = false;
                 self.confirm_overwrite = false;
-                self.status = tr(lang, T::OpenedNPages).replace("{n}", &n.to_string());
+                self.undo.clear();
+                self.redo.clear();
+                self.saved_sig = self.edit_sig();
+                self.info(tr(lang, T::OpenedNPages).replace("{n}", &n.to_string()));
             }
-            Err(e) => self.status = tr(lang, T::OpenError).replace("{e}", &e),
+            Err(e) => self.fail(tr(lang, T::OpenError).replace("{e}", &e)),
         }
     }
 
@@ -182,34 +473,37 @@ impl CbzApp {
 
     fn pick_image_page(&mut self) -> Option<Page> {
         let mut dlg = rfd::FileDialog::new()
-            .add_filter(tr(self.lang, T::DlgImagesFilter), &["jpg", "jpeg", "png", "webp", "gif", "bmp"])
+            .add_filter(
+                tr(self.lang, T::DlgImagesFilter),
+                &["jpg", "jpeg", "png", "webp", "gif", "bmp"],
+            )
             .set_title(tr(self.lang, T::DlgImageInsertTitle));
         if let Some(d) = self.last_dir.as_ref().filter(|d| d.is_dir()) {
             dlg = dlg.set_directory(d);
         }
         let path = dlg.pick_file()?;
-        let bytes = std::fs::read(&path).ok()?;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.fail(tr(self.lang, T::ReadError).replace("{e}", &e.to_string()));
+                return None;
+            }
+        };
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "image.jpg".into());
-        let uid = self.next_uid;
-        self.next_uid += 1;
-        Some(Page {
-            name,
-            bytes,
-            thumb: None,
-            failed: false,
-            delete: false,
-            uid,
-        })
+        let uid = self.new_uid();
+        Some(Page::new(name, bytes.into(), uid))
     }
 
     // Extrait une page vers un fichier image sur le disque (utile p.ex. pour récupérer
     // la couverture du tome suivant rangée par erreur dans le mauvais tome).
     fn extract_page(&mut self, idx: usize) {
         let lang = self.lang;
-        let Some(page) = self.pages.get(idx) else { return };
+        let Some(page) = self.pages.get(idx) else {
+            return;
+        };
         let ext = Path::new(&page.name)
             .extension()
             .and_then(|e| e.to_str())
@@ -237,10 +531,13 @@ impl CbzApp {
         if let Some(out) = dlg.save_file() {
             match std::fs::write(&out, &bytes) {
                 Ok(_) => {
-                    let nm = out.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    self.status = tr(lang, T::Extracted).replace("{name}", &nm);
+                    let nm = out
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.info(tr(lang, T::Extracted).replace("{name}", &nm));
                 }
-                Err(e) => self.status = tr(lang, T::ExtractError).replace("{e}", &e.to_string()),
+                Err(e) => self.fail(tr(lang, T::ExtractError).replace("{e}", &e.to_string())),
             }
         }
     }
@@ -250,29 +547,34 @@ impl CbzApp {
     fn mark_all_duplicates(&mut self) {
         let lang = self.lang;
         let groups = self.duplicate_groups();
-        let mut marked = 0usize;
-        for g in &groups {
-            for &i in g {
-                if !self.pages[i].delete {
-                    self.pages[i].delete = true;
-                    marked += 1;
-                }
-            }
+        let to_mark: Vec<usize> = groups
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|&i| !self.pages[i].delete)
+            .collect();
+        if to_mark.is_empty() {
+            self.info(tr(lang, T::NoDuplicates));
+            return;
         }
-        self.status = if marked == 0 {
-            tr(lang, T::NoDuplicates).to_string()
-        } else {
+        self.checkpoint();
+        for &i in &to_mark {
+            self.pages[i].delete = true;
+        }
+        self.info(
             tr(lang, T::DupMarked)
-                .replace("{marked}", &marked.to_string())
-                .replace("{groups}", &groups.len().to_string())
-        };
+                .replace("{marked}", &to_mark.len().to_string())
+                .replace("{groups}", &groups.len().to_string()),
+        );
     }
 
     // Coche pour suppression toutes les pages au contenu identique à `idx` (y compris
     // celle-ci), à condition qu'il existe au moins une autre copie.
     fn mark_identical(&mut self, idx: usize) {
         let same: Vec<usize> = {
-            let Some(rp) = self.pages.get(idx) else { return };
+            let Some(rp) = self.pages.get(idx) else {
+                return;
+            };
             let rb = &rp.bytes;
             self.pages
                 .iter()
@@ -282,13 +584,14 @@ impl CbzApp {
                 .collect()
         };
         if same.len() < 2 {
-            self.status = tr(self.lang, T::NoIdenticalCopy).to_string();
+            self.info(tr(self.lang, T::NoIdenticalCopy));
             return;
         }
+        self.checkpoint();
         for &i in &same {
             self.pages[i].delete = true;
         }
-        self.status = tr(self.lang, T::IdenticalMarked).replace("{n}", &same.len().to_string());
+        self.info(tr(self.lang, T::IdenticalMarked).replace("{n}", &same.len().to_string()));
     }
 
     // Groupes de pages au contenu strictement identique (octets), de taille ≥ 2.
@@ -316,6 +619,7 @@ impl CbzApp {
             }
             groups.extend(buckets.into_iter().filter(|b| b.len() >= 2));
         }
+        groups.sort();
         groups
     }
 
@@ -336,14 +640,18 @@ impl CbzApp {
                 continue;
             }
             let name = e.name().to_string();
+            // Métadonnées macOS (« __MACOSX/ », fichiers « ._xxx.jpg ») : ce ne sont
+            // pas des images, elles apparaîtraient comme pages illisibles.
+            let base = name.rsplit('/').next().unwrap_or(&name);
+            if name.starts_with("__MACOSX/") || base.starts_with("._") {
+                continue;
+            }
             let lower = name.to_lowercase();
             let is_xml = lower.ends_with(".xml");
-            let is_img = lower.ends_with(".jpg")
-                || lower.ends_with(".jpeg")
-                || lower.ends_with(".png")
-                || lower.ends_with(".webp")
-                || lower.ends_with(".gif")
-                || lower.ends_with(".bmp");
+            let is_img = Path::new(&lower)
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(is_image_ext);
             if !is_xml && !is_img {
                 continue;
             }
@@ -367,14 +675,7 @@ impl CbzApp {
                     ci_is_comicinfo = is_comicinfo;
                 }
             } else {
-                pages.push(Page {
-                    name,
-                    bytes: buf,
-                    thumb: None,
-                    failed: false,
-                    delete: false,
-                    uid: 0,
-                });
+                pages.push(Page::new(name, buf.into(), 0));
             }
         }
         // Tri « naturel » : page2 < page10 (un tri lexical donnerait page10 < page2).
@@ -382,54 +683,58 @@ impl CbzApp {
         Ok((pages, ci))
     }
 
+    // Envoie au décodeur les pages sans miniature, et récupère les miniatures prêtes.
     fn generate_thumbnails(&mut self, ctx: &egui::Context) {
-        let mut budget = 6;
+        let Some(t) = &self.thumbs else { return };
         let gen = self.generation;
-        let mut pending = false;
-        for page in self.pages.iter_mut() {
-            if page.thumb.is_some() || page.failed {
+        while let Ok(done) = t.done.try_recv() {
+            if done.gen != gen {
                 continue;
             }
-            if budget == 0 {
-                pending = true;
-                break;
-            }
-            budget -= 1;
-            match image::load_from_memory(&page.bytes) {
-                Ok(img) => {
-                    let t = img.thumbnail(220, 320);
-                    let rgba = t.to_rgba8();
-                    let ci = ColorImage::from_rgba_unmultiplied(
-                        [t.width() as usize, t.height() as usize],
-                        rgba.as_raw(),
-                    );
-                    page.thumb = Some(ctx.load_texture(
-                        format!("thumb-{gen}-{}", page.uid),
-                        ci,
-                        TextureOptions::LINEAR,
-                    ));
+            self.thumb_pending.remove(&done.uid);
+            if let Some(page) = self.pages.iter_mut().find(|p| p.uid == done.uid) {
+                match done.img {
+                    Some(ci) => {
+                        page.thumb = Some(ctx.load_texture(
+                            format!("thumb-{gen}-{}", done.uid),
+                            ci,
+                            TextureOptions::LINEAR,
+                        ))
+                    }
+                    None => page.failed = true,
                 }
-                Err(_) => page.failed = true,
             }
         }
-        if pending {
-            ctx.request_repaint();
+        for page in &self.pages {
+            if page.thumb.is_none() && !page.failed && self.thumb_pending.insert(page.uid) {
+                let _ = t.jobs.send(ThumbJob {
+                    gen,
+                    uid: page.uid,
+                    bytes: page.bytes.clone(),
+                });
+            }
         }
     }
 
     fn open_viewer(&mut self, idx: usize) {
-        self.viewer = Some(ViewerState { idx, tex: None, failed: false });
+        let zoom = self.viewer.as_ref().is_some_and(|v| v.zoom);
+        self.viewer = Some(ViewerState {
+            idx,
+            tex: None,
+            failed: false,
+            zoom,
+        });
     }
 
     fn viewer_go(&mut self, d: i32) {
+        let total = self.pages.len() as i64;
         if let Some(vs) = self.viewer.as_mut() {
-            let total = self.pages.len() as i32;
             if total == 0 {
                 return;
             }
-            let n = (vs.idx as i32 + d).clamp(0, total - 1);
-            if n as usize != vs.idx {
-                vs.idx = n as usize;
+            let n = (vs.idx as i64 + d as i64).clamp(0, total - 1) as usize;
+            if n != vs.idx {
+                vs.idx = n;
                 vs.tex = None;
                 vs.failed = false;
             }
@@ -462,15 +767,23 @@ impl CbzApp {
     // Petite barre verticale marquant l'endroit où l'image sera insérée.
     fn insert_marker(&self, idx: usize) -> Option<Rect> {
         if let Some((_, r)) = self.card_rects.iter().find(|(i, _)| *i == idx) {
-            Some(Rect::from_min_max(Pos2::new(r.left() - 4.0, r.top()), Pos2::new(r.left(), r.bottom())))
+            Some(Rect::from_min_max(
+                Pos2::new(r.left() - 4.0, r.top()),
+                Pos2::new(r.left(), r.bottom()),
+            ))
         } else {
             let (_, r) = self.card_rects.last()?;
-            Some(Rect::from_min_max(Pos2::new(r.right(), r.top()), Pos2::new(r.right() + 4.0, r.bottom())))
+            Some(Rect::from_min_max(
+                Pos2::new(r.right(), r.top()),
+                Pos2::new(r.right() + 4.0, r.bottom()),
+            ))
         }
     }
 
     fn enter_crop(&mut self, idx: usize, ctx: &egui::Context) {
-        let Some(page) = self.pages.get(idx) else { return };
+        let Some(page) = self.pages.get(idx) else {
+            return;
+        };
         match image::load_from_memory(&page.bytes) {
             Ok(img) => {
                 let disp = display_copy(&img, 1600);
@@ -489,9 +802,9 @@ impl CbzApp {
                     press: Pos2::ZERO,
                     sel_press: [0, 0, 0, 0],
                 });
-                self.status = tr(self.lang, T::CropHintEnter).to_string();
+                self.info(tr(self.lang, T::CropHintEnter));
             }
-            Err(e) => self.status = tr(self.lang, T::DecodePageError).replace("{e}", &e.to_string()),
+            Err(e) => self.fail(tr(self.lang, T::DecodePageError).replace("{e}", &e.to_string())),
         }
     }
 
@@ -502,50 +815,75 @@ impl CbzApp {
         } else if let Some([x, y, w, h]) = cs.sel {
             cs.img.crop_imm(x, y, w, h)
         } else {
-            self.status = tr(self.lang, T::NoSelection).to_string();
+            self.fail(tr(self.lang, T::NoSelection));
             self.crop = Some(cs);
             return;
         };
         let bytes = match encode_jpeg(&cropped, 92) {
             Ok(b) => b,
             Err(e) => {
-                self.status = tr(self.lang, T::CoverEncodeError).replace("{e}", &e);
+                self.fail(tr(self.lang, T::CoverEncodeError).replace("{e}", &e));
                 self.crop = Some(cs);
                 return;
             }
         };
-        let t = cropped.thumbnail(220, 320);
+        let t = cropped.thumbnail(THUMB_W, THUMB_H);
         let rgba = t.to_rgba8();
         let ci = ColorImage::from_rgba_unmultiplied(
             [t.width() as usize, t.height() as usize],
             rgba.as_raw(),
         );
-        let tex = ctx.load_texture("cover-preview", ci, TextureOptions::LINEAR);
-        self.cover = Some((bytes, Some(tex)));
-        self.status = tr(self.lang, T::CoverReadyStatus).to_string();
+        let id = self.new_uid();
+        let tex = ctx.load_texture(format!("cover-{id}"), ci, TextureOptions::LINEAR);
+        self.checkpoint();
+        self.cover = Some(Cover {
+            bytes: bytes.into(),
+            tex,
+            id,
+        });
+        self.info(tr(self.lang, T::CoverReadyStatus));
+    }
+
+    fn remove_cover(&mut self) {
+        if self.cover.is_some() {
+            self.checkpoint();
+            self.cover = None;
+            self.info(tr(self.lang, T::CoverRemoved));
+        }
+    }
+
+    fn toggle_delete(&mut self, idx: usize) {
+        if idx < self.pages.len() {
+            self.checkpoint();
+            self.pages[idx].delete = !self.pages[idx].delete;
+        }
     }
 
     fn merge_next(&mut self, i: usize) {
         let lang = self.lang;
         if i + 1 >= self.pages.len() {
-            self.status = tr(lang, T::NoNextToMerge).to_string();
+            self.fail(tr(lang, T::NoNextToMerge));
             return;
         }
         let a = match image::load_from_memory(&self.pages[i].bytes) {
             Ok(x) => x,
             Err(e) => {
-                self.status = tr(lang, T::DecodePageN)
-                    .replace("{page}", &(i + 1).to_string())
-                    .replace("{e}", &e.to_string());
+                self.fail(
+                    tr(lang, T::DecodePageN)
+                        .replace("{page}", &(i + 1).to_string())
+                        .replace("{e}", &e.to_string()),
+                );
                 return;
             }
         };
         let b = match image::load_from_memory(&self.pages[i + 1].bytes) {
             Ok(x) => x,
             Err(e) => {
-                self.status = tr(lang, T::DecodePageN)
-                    .replace("{page}", &(i + 2).to_string())
-                    .replace("{e}", &e.to_string());
+                self.fail(
+                    tr(lang, T::DecodePageN)
+                        .replace("{page}", &(i + 2).to_string())
+                        .replace("{e}", &e.to_string()),
+                );
                 return;
             }
         };
@@ -555,31 +893,26 @@ impl CbzApp {
         let bytes = match encode_jpeg(&merged, 92) {
             Ok(b) => b,
             Err(e) => {
-                self.status = tr(lang, T::MergeEncodeError).replace("{e}", &e);
+                self.fail(tr(lang, T::MergeEncodeError).replace("{e}", &e));
                 return;
             }
         };
-        let uid = self.next_uid;
-        self.next_uid += 1;
-        self.pages[i] = Page {
-            name: format!("merged-{uid}.jpg"),
-            bytes,
-            thumb: None,
-            failed: false,
-            delete: false,
-            uid,
-        };
+        self.checkpoint();
+        let uid = self.new_uid();
+        self.pages[i] = Page::new(format!("merged-{uid}.jpg"), bytes.into(), uid);
         self.pages.remove(i + 1);
         self.dirty_order = true;
-        self.status = tr(lang, T::Merged).to_string();
+        self.info(tr(lang, T::Merged));
     }
 
     fn enter_split(&mut self, idx: usize, ctx: &egui::Context) {
-        let Some(page) = self.pages.get(idx) else { return };
+        let Some(page) = self.pages.get(idx) else {
+            return;
+        };
         match image::load_from_memory(&page.bytes) {
             Ok(img) => {
                 if img.width() < 2 {
-                    self.status = tr(self.lang, T::TooNarrowToSplit).to_string();
+                    self.fail(tr(self.lang, T::TooNarrowToSplit));
                     return;
                 }
                 let disp = display_copy(&img, 1800);
@@ -597,9 +930,9 @@ impl CbzApp {
                     img,
                     tex,
                 });
-                self.status = tr(self.lang, T::SplitHintEnter).to_string();
+                self.info(tr(self.lang, T::SplitHintEnter));
             }
-            Err(e) => self.status = tr(self.lang, T::DecodeError).replace("{e}", &e.to_string()),
+            Err(e) => self.fail(tr(self.lang, T::DecodeError).replace("{e}", &e.to_string())),
         }
     }
 
@@ -607,7 +940,7 @@ impl CbzApp {
         let Some(ss) = self.split.take() else { return };
         let w = ss.img.width();
         if w < 2 {
-            self.status = tr(self.lang, T::TooNarrowToSplit).to_string();
+            self.fail(tr(self.lang, T::TooNarrowToSplit));
             return;
         }
         let cut = ss.cut.clamp(1, w - 1);
@@ -617,39 +950,25 @@ impl CbzApp {
         let (fb, sb) = match (encode_jpeg(&first, 92), encode_jpeg(&second, 92)) {
             (Ok(f), Ok(s)) => (f, s),
             _ => {
-                self.status = tr(self.lang, T::SplitEncodeError).to_string();
+                self.fail(tr(self.lang, T::SplitEncodeError));
+                self.split = Some(ss);
                 return;
             }
         };
-        let u1 = self.next_uid;
-        let u2 = self.next_uid + 1;
-        self.next_uid += 2;
-        let p1 = Page {
-            name: format!("split-{u1}.jpg"),
-            bytes: fb,
-            thumb: None,
-            failed: false,
-            delete: false,
-            uid: u1,
-        };
-        let p2 = Page {
-            name: format!("split-{u2}.jpg"),
-            bytes: sb,
-            thumb: None,
-            failed: false,
-            delete: false,
-            uid: u2,
-        };
         if ss.idx < self.pages.len() {
+            self.checkpoint();
+            let (u1, u2) = (self.new_uid(), self.new_uid());
             self.pages.remove(ss.idx);
-            self.pages.insert(ss.idx, p2);
-            self.pages.insert(ss.idx, p1);
+            self.pages
+                .insert(ss.idx, Page::new(format!("split-{u2}.jpg"), sb.into(), u2));
+            self.pages
+                .insert(ss.idx, Page::new(format!("split-{u1}.jpg"), fb.into(), u1));
             self.dirty_order = true;
-            self.status = tr(self.lang, T::SplitDone).to_string();
+            self.info(tr(self.lang, T::SplitDone));
         }
     }
 
-    fn split_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    fn split_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         enum SAct {
             None,
             Cancel,
@@ -658,17 +977,31 @@ impl CbzApp {
         }
         let mut sa = SAct::None;
         let lang = self.lang;
+        let pal = pal(ctx);
         if let Some(ss) = self.split.as_mut() {
-            let pname = self.pages.get(ss.idx).map(|p| p.name.clone()).unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(tr(lang, T::SplitTitle).replace("{pname}", &pname)).strong());
-            });
+            let pname = self
+                .pages
+                .get(ss.idx)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(tr(lang, T::SplitTitle).replace("{pname}", &short_name(&pname)))
+                    .strong(),
+            );
             ui.label(tr(lang, T::SplitHint2));
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(tr(lang, T::SplitApply)).color(Color32::from_rgb(120, 200, 120))).clicked() {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button(RichText::new(tr(lang, T::SplitApply)).color(pal.ok))
+                    .on_hover_text(tr(lang, T::KeyEnter))
+                    .clicked()
+                {
                     sa = SAct::Validate;
                 }
-                if ui.button(tr(lang, T::Cancel)).clicked() {
+                if ui
+                    .button(tr(lang, T::Cancel))
+                    .on_hover_text(tr(lang, T::KeyEsc))
+                    .clicked()
+                {
                     sa = SAct::Cancel;
                 }
                 let dir = if ss.rtl {
@@ -676,13 +1009,20 @@ impl CbzApp {
                 } else {
                     tr(lang, T::DirLtrSplit)
                 };
-                if ui.button(tr(lang, T::SplitDirBtn).replace("{dir}", dir)).on_hover_text(tr(lang, T::FlipDirHover)).clicked() {
+                if ui
+                    .button(tr(lang, T::SplitDirBtn).replace("{dir}", dir))
+                    .on_hover_text(tr(lang, T::FlipDirHover))
+                    .clicked()
+                {
                     sa = SAct::Flip;
                 }
                 ui.label(
-                    tr(lang, T::CutAt)
-                        .replace("{cut}", &ss.cut.to_string())
-                        .replace("{width}", &ss.img.width().to_string()),
+                    RichText::new(
+                        tr(lang, T::CutAt)
+                            .replace("{cut}", &ss.cut.to_string())
+                            .replace("{width}", &ss.img.width().to_string()),
+                    )
+                    .weak(),
                 );
             });
             ui.separator();
@@ -690,12 +1030,21 @@ impl CbzApp {
             let iw = ss.img.width();
             let ih = ss.img.height();
             let avail = ui.available_size();
-            let disp = fit([iw as usize, ih as usize], Vec2::new(avail.x.max(64.0), (avail.y - 6.0).max(64.0)));
-            let (resp, painter) = ui.allocate_painter(disp, Sense::drag());
+            let disp = fit(
+                [iw as usize, ih as usize],
+                Vec2::new(avail.x.max(64.0), (avail.y - 6.0).max(64.0)),
+            );
+            let (resp, painter) = ui.allocate_painter(disp, Sense::click_and_drag());
             let area = resp.rect;
-            painter.image(ss.tex.id(), area, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            painter.image(
+                ss.tex.id(),
+                area,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
 
-            if resp.dragged() || resp.drag_started() {
+            // Un simple clic place aussi la ligne de coupe (pas seulement le glisser).
+            if resp.dragged() || resp.drag_started() || resp.clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let fx = ((p.x - area.left()) / area.width().max(1.0) * iw as f32).round();
                     let hi = (iw as i32 - 1).max(1);
@@ -703,7 +1052,7 @@ impl CbzApp {
                 }
             }
             if resp.hovered() {
-                _ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
+                ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
 
             let cx = area.left() + ss.cut as f32 / iw as f32 * area.width();
@@ -714,11 +1063,39 @@ impl CbzApp {
             } else {
                 (left_rect, right_rect)
             };
-            painter.rect_filled(first_rect, 0.0, Color32::from_rgba_unmultiplied(0, 200, 80, 30));
-            painter.rect_filled(second_rect, 0.0, Color32::from_rgba_unmultiplied(120, 120, 120, 30));
-            painter.line_segment([Pos2::new(cx, area.top()), Pos2::new(cx, area.bottom())], Stroke::new(2.0, Color32::from_rgb(255, 70, 70)));
-            painter.text(first_rect.center(), Align2::CENTER_CENTER, tr(lang, T::FirstPage), FontId::proportional(30.0), Color32::from_rgb(180, 255, 200));
-            painter.text(second_rect.center(), Align2::CENTER_CENTER, tr(lang, T::SecondPage), FontId::proportional(30.0), Color32::from_rgb(225, 225, 225));
+            // Superpositions sur l'image : couleurs fixes (indépendantes du thème).
+            painter.rect_filled(
+                first_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(0, 200, 80, 30),
+            );
+            painter.rect_filled(
+                second_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(120, 120, 120, 30),
+            );
+            painter.line_segment(
+                [Pos2::new(cx, area.top()), Pos2::new(cx, area.bottom())],
+                Stroke::new(2.0, Color32::from_rgb(255, 70, 70)),
+            );
+            for (r, txt, col) in [
+                (
+                    first_rect,
+                    tr(lang, T::FirstPage),
+                    Color32::from_rgb(180, 255, 200),
+                ),
+                (
+                    second_rect,
+                    tr(lang, T::SecondPage),
+                    Color32::from_rgb(235, 235, 235),
+                ),
+            ] {
+                // Pastille sombre derrière le texte : lisible sur une page blanche.
+                let g = painter.layout_no_wrap(txt.to_string(), FontId::proportional(30.0), col);
+                let bg = Rect::from_center_size(r.center(), g.size() + Vec2::new(20.0, 10.0));
+                painter.rect_filled(bg, 8.0, Color32::from_black_alpha(150));
+                painter.galley(r.center() - g.size() / 2.0, g, col);
+            }
         }
         match sa {
             SAct::Cancel => {
@@ -735,93 +1112,143 @@ impl CbzApp {
         }
     }
 
-    fn build_cbz(&self) -> Result<Vec<u8>, String> {
-        let new_cover = self.cover.as_ref().map(|(b, _)| b.clone());
-        let existing_cover = self
+    // Construit l'archive à écrire. Renvoie aussi, pour chaque image écrite, son nom
+    // dans l'archive et l'uid de la page d'origine (None = nouvelle couverture), afin
+    // de resynchroniser l'état en mémoire après un « Écraser l'original ».
+    fn build_cbz(&self) -> Result<Built, String> {
+        // Page couverture existante (« 000_cover… ») : UNE seule, la première gardée.
+        // Une nouvelle couverture recadrée la remplace.
+        let old_cover = self
             .pages
             .iter()
-            .find(|p| !p.delete && p.name.to_lowercase().contains("000_cover"))
-            .map(|p| p.bytes.clone());
-        let cover_bytes = new_cover.or(existing_cover);
+            .position(|p| !p.delete && is_cover_name(&p.name));
+        let (cover_bytes, cover_uid, cover_ext): (Option<Arc<[u8]>>, Option<u64>, String) =
+            match (&self.cover, old_cover) {
+                (Some(c), _) => (Some(c.bytes.clone()), None, "jpg".into()),
+                (None, Some(i)) => (
+                    Some(self.pages[i].bytes.clone()),
+                    Some(self.pages[i].uid),
+                    ext_of(&self.pages[i].name),
+                ),
+                (None, None) => (None, None, String::new()),
+            };
+        let cover_name = format!("000_cover.{cover_ext}");
 
         let content: Vec<&Page> = self
             .pages
             .iter()
-            .filter(|p| !p.delete && !p.name.to_lowercase().contains("000_cover"))
+            .enumerate()
+            .filter(|&(i, p)| !p.delete && Some(i) != old_cover)
+            .map(|(_, p)| p)
             .collect();
+        if content.is_empty() && cover_bytes.is_none() {
+            return Err(tr(self.lang, T::NoPagesToSave).to_string());
+        }
 
-        let n_images = content.len() + if cover_bytes.is_some() { 1 } else { 0 };
+        // Noms d'origine conservés, sauf si l'ordre a changé, ou si la couverture ne
+        // serait pas triée en tête (tri naturel ET lexical, selon le lecteur).
+        let cover_not_first = cover_bytes.is_some()
+            && content.iter().any(|p| {
+                natural_cmp(&p.name, &cover_name) != std::cmp::Ordering::Greater
+                    || p.name.as_str() <= cover_name.as_str()
+            });
+        let renumber = self.dirty_order || cover_not_first;
+        let n_images = content.len() + usize::from(cover_bytes.is_some());
 
+        let mut entries: Vec<(String, Option<u64>)> = Vec::with_capacity(n_images);
+        let mut comicinfo = None;
         let mut cur = Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut cur);
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             if let Some(ci) = &self.comicinfo {
-                let patched = update_pagecount(ci, n_images);
-                zw.start_file("ComicInfo.xml", opts).map_err(|e| e.to_string())?;
+                let mut patched = update_pagecount(ci, n_images);
+                // Le bloc <Pages> (types de page, doubles-pages…) décrit l'ancienne
+                // liste : s'il ne correspond plus, mieux vaut le retirer qu'induire
+                // le lecteur en erreur.
+                let changed =
+                    renumber || self.cover.is_some() || self.pages.iter().any(|p| p.delete);
+                if changed {
+                    patched = strip_pages_block(&patched);
+                }
+                zw.start_file("ComicInfo.xml", opts)
+                    .map_err(|e| e.to_string())?;
                 zw.write_all(&patched).map_err(|e| e.to_string())?;
+                comicinfo = Some(patched);
             }
             if let Some(cover) = &cover_bytes {
-                zw.start_file("000_cover.jpg", opts).map_err(|e| e.to_string())?;
+                zw.start_file(cover_name.as_str(), opts)
+                    .map_err(|e| e.to_string())?;
                 zw.write_all(cover).map_err(|e| e.to_string())?;
+                entries.push((cover_name.clone(), cover_uid));
             }
             for (i, p) in content.iter().enumerate() {
-                let name = if self.dirty_order {
-                    let ext = Path::new(&p.name)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jpg");
-                    format!("p{:04}.{}", i, ext)
+                let name = if renumber {
+                    format!("p{:04}.{}", i, ext_of(&p.name))
                 } else {
                     p.name.clone()
                 };
-                zw.start_file(name, opts).map_err(|e| e.to_string())?;
+                zw.start_file(name.as_str(), opts)
+                    .map_err(|e| e.to_string())?;
                 zw.write_all(&p.bytes).map_err(|e| e.to_string())?;
+                entries.push((name, Some(p.uid)));
             }
             zw.finish().map_err(|e| e.to_string())?;
         }
-        Ok(cur.into_inner())
+        Ok(Built {
+            data: cur.into_inner(),
+            entries,
+            comicinfo,
+        })
     }
 
-    fn save(&mut self, overwrite: bool) {
+    // Enregistre ; renvoie true en cas de succès.
+    fn save(&mut self, overwrite: bool) -> bool {
         let lang = self.lang;
         let Some(path) = self.path.clone() else {
-            self.status = tr(lang, T::NoFileOpen).to_string();
-            return;
+            self.fail(tr(lang, T::NoFileOpen));
+            return false;
         };
-        let data = match self.build_cbz() {
+        let built = match self.build_cbz() {
             Ok(d) => d,
             Err(e) => {
-                self.status = tr(lang, T::BuildError).replace("{e}", &e);
-                return;
+                self.fail(tr(lang, T::BuildError).replace("{e}", &e));
+                return false;
             }
         };
-        let kept = self.pages.iter().filter(|p| !p.delete).count();
+        let kept = built.entries.len();
         if overwrite {
             let mut bak = path.clone().into_os_string();
             bak.push(".bak");
             let bak = PathBuf::from(bak);
-            if !bak.exists() {
+            let bak_created = !bak.exists();
+            if bak_created {
                 if let Err(e) = std::fs::copy(&path, &bak) {
-                    self.status = tr(lang, T::BakError).replace("{e}", &e.to_string());
-                    return;
+                    self.fail(tr(lang, T::BakError).replace("{e}", &e.to_string()));
+                    return false;
                 }
             }
             let mut tmp = path.clone().into_os_string();
             tmp.push(".tmp");
             let tmp = PathBuf::from(tmp);
-            if let Err(e) = std::fs::write(&tmp, &data) {
+            if let Err(e) = write_synced(&tmp, &built.data) {
                 let _ = std::fs::remove_file(&tmp);
-                self.status = tr(lang, T::WriteError).replace("{e}", &e.to_string());
-                return;
+                self.fail(tr(lang, T::WriteError).replace("{e}", &e.to_string()));
+                return false;
             }
             if let Err(e) = std::fs::rename(&tmp, &path) {
                 let _ = std::fs::remove_file(&tmp);
-                self.status = tr(lang, T::ReplaceError).replace("{e}", &e.to_string());
-                return;
+                self.fail(tr(lang, T::ReplaceError).replace("{e}", &e.to_string()));
+                return false;
             }
-            self.status = tr(lang, T::Overwritten).replace("{kept}", &kept.to_string());
+            self.sync_after_overwrite(built);
+            let msg = if bak_created {
+                T::Overwritten
+            } else {
+                T::OverwrittenBakKept
+            };
+            self.info(tr(lang, msg).replace("{kept}", &kept.to_string()));
         } else {
             let stem = path
                 .file_stem()
@@ -836,31 +1263,89 @@ impl CbzApp {
                 out = parent.join(format!("{stem} ({suffix} {k}).cbz"));
                 k += 1;
             }
-            if let Err(e) = std::fs::write(&out, &data) {
-                self.status = tr(lang, T::WriteError).replace("{e}", &e.to_string());
-                return;
+            if let Err(e) = write_synced(&out, &built.data) {
+                let _ = std::fs::remove_file(&out);
+                self.fail(tr(lang, T::WriteError).replace("{e}", &e.to_string()));
+                return false;
             }
-            let nm = out.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            self.status = tr(lang, T::CopySaved).replace("{name}", &nm);
+            // Le travail est en sécurité dans la copie : plus rien de « non enregistré ».
+            self.saved_sig = self.edit_sig();
+            let nm = out
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.info(tr(lang, T::CopySaved).replace("{name}", &nm));
         }
+        true
     }
 
-    fn top_ui(&mut self, ui: &mut egui::Ui) {
+    // Après écrasement, l'état en mémoire reflète exactement le fichier écrit : pages
+    // supprimées retirées, noms définitifs, couverture intégrée comme page 1.
+    // Les miniatures déjà calculées sont réutilisées (par uid).
+    fn sync_after_overwrite(&mut self, built: Built) {
+        let mut by_uid: std::collections::HashMap<u64, Page> =
+            self.pages.drain(..).map(|p| (p.uid, p)).collect();
+        let cover = self.cover.take();
+        for (name, uid) in built.entries {
+            match uid.and_then(|u| by_uid.remove(&u)) {
+                Some(mut p) => {
+                    p.name = name;
+                    self.pages.push(p);
+                }
+                None => {
+                    if let Some(c) = &cover {
+                        let uid = self.new_uid();
+                        let mut p = Page::new(name, c.bytes.clone(), uid);
+                        p.thumb = Some(c.tex.clone());
+                        self.pages.push(p);
+                    }
+                }
+            }
+        }
+        self.comicinfo = built.comicinfo;
+        self.dirty_order = false;
+        self.undo.clear();
+        self.redo.clear();
+        if let Some(vs) = self.viewer.as_mut() {
+            vs.idx = vs.idx.min(self.pages.len().saturating_sub(1));
+            vs.tex = None;
+            vs.failed = false;
+        }
+        self.saved_sig = self.edit_sig();
+    }
+
+    fn top_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let lang = self.lang;
+        let pal = pal(ctx);
+        let modified = self.is_modified();
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if ui.button(RichText::new(tr(self.lang, T::OpenCbz)).size(15.0)).clicked() {
-                self.open_dialog();
+            if ui
+                .button(RichText::new(tr(lang, T::OpenCbz)).size(15.0))
+                .on_hover_text("Ctrl+O")
+                .clicked()
+            {
+                self.request_open(None);
             }
             ui.separator();
             match &self.path {
                 Some(p) => {
-                    ui.label(RichText::new("📖").size(18.0));
+                    ui.label(RichText::new("📄").size(16.0));
                     ui.label(
-                        RichText::new(p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
-                            .strong(),
-                    );
+                        RichText::new(
+                            p.file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        )
+                        .strong(),
+                    )
+                    .on_hover_text(p.to_string_lossy());
+                    if modified {
+                        ui.colored_label(pal.warn, tr(lang, T::Unsaved));
+                    }
                 }
                 None => {
-                    ui.label(tr(self.lang, T::OpenHintNoFile));
+                    ui.label(RichText::new(tr(lang, T::OpenHintNoFile)).weak());
                 }
             }
             // Sélecteur de langue, aligné à droite.
@@ -879,62 +1364,97 @@ impl CbzApp {
                 if new_lang != cur {
                     self.lang = new_lang;
                     save_lang(new_lang);
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Title(tr(new_lang, T::WindowTitle).to_string()));
                 }
             });
         });
         if self.path.is_some() {
-            ui.horizontal(|ui| {
-                let total = self.pages.len();
-                let del = self.pages.iter().filter(|p| p.delete).count();
-                ui.label(tr(self.lang, T::PagesCount).replace("{n}", &total.to_string()));
-                if del > 0 {
-                    ui.colored_label(
-                        Color32::from_rgb(220, 90, 90),
-                        tr(self.lang, T::ToDelete).replace("{n}", &del.to_string()),
-                    );
-                }
-                if self.dirty_order {
-                    ui.colored_label(Color32::from_rgb(150, 150, 220), tr(self.lang, T::OrderChanged));
-                }
-                if self.cover.is_some() {
-                    ui.colored_label(Color32::from_rgb(80, 180, 100), tr(self.lang, T::CoverFlag));
-                }
-                if ui
-                    .button(tr(self.lang, T::MarkDuplicates))
-                    .on_hover_text(tr(self.lang, T::MarkDuplicatesHover))
-                    .clicked()
-                {
-                    self.mark_all_duplicates();
-                }
-                ui.separator();
-                let dir = if self.rtl { tr(self.lang, T::DirRtl) } else { tr(self.lang, T::DirLtr) };
-                if ui.button(dir).on_hover_text(tr(self.lang, T::DirHover)).clicked() {
-                    self.rtl = !self.rtl;
-                }
-                ui.separator();
-                if ui.button(tr(self.lang, T::SaveCopy)).clicked() {
-                    self.save(false);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new(tr(self.lang, T::Overwrite)).color(Color32::from_rgb(230, 160, 60)),
-                    ))
-                    .on_hover_text(tr(self.lang, T::OverwriteHover))
-                    .clicked()
-                {
-                    self.confirm_overwrite = true;
-                }
-                if let Some((_, Some(tex))) = &self.cover {
-                    let sz = fit(tex.size(), Vec2::new(60.0, 60.0));
-                    ui.image(SizedTexture::new(tex.id(), sz));
-                }
+            // Pendant un recadrage/une découpe, la barre d'édition est grisée : il faut
+            // d'abord valider ou annuler l'opération en cours.
+            let editing = self.crop.is_none() && self.split.is_none();
+            ui.add_enabled_ui(editing, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!self.undo.is_empty(), egui::Button::new(tr(lang, T::Undo)))
+                        .on_hover_text(tr(lang, T::UndoHover))
+                        .clicked()
+                    {
+                        self.undo();
+                    }
+                    if ui
+                        .add_enabled(!self.redo.is_empty(), egui::Button::new(tr(lang, T::Redo)))
+                        .on_hover_text(tr(lang, T::RedoHover))
+                        .clicked()
+                    {
+                        self.redo();
+                    }
+                    ui.separator();
+                    let total = self.pages.len();
+                    let del = self.pages.iter().filter(|p| p.delete).count();
+                    ui.label(tr(lang, T::PagesCount).replace("{n}", &total.to_string()));
+                    if del > 0 {
+                        ui.colored_label(
+                            pal.danger,
+                            tr(lang, T::ToDelete).replace("{n}", &del.to_string()),
+                        );
+                    }
+                    if self.dirty_order {
+                        ui.colored_label(pal.info, tr(lang, T::OrderChanged));
+                    }
+                    let mut remove_cover = false;
+                    if let Some(c) = &self.cover {
+                        ui.colored_label(pal.ok, tr(lang, T::CoverFlag));
+                        let sz = fit(c.tex.size(), Vec2::new(40.0, 40.0));
+                        ui.image(SizedTexture::new(c.tex.id(), sz));
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text(tr(lang, T::RemoveCoverHover))
+                            .clicked()
+                        {
+                            remove_cover = true;
+                        }
+                    }
+                    if remove_cover {
+                        self.remove_cover();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(tr(lang, T::MarkDuplicates))
+                        .on_hover_text(tr(lang, T::MarkDuplicatesHover))
+                        .clicked()
+                    {
+                        self.mark_all_duplicates();
+                    }
+                    let dir = if self.rtl {
+                        tr(lang, T::DirRtl)
+                    } else {
+                        tr(lang, T::DirLtr)
+                    };
+                    if ui
+                        .button(dir)
+                        .on_hover_text(tr(lang, T::DirHover))
+                        .clicked()
+                    {
+                        self.rtl = !self.rtl;
+                    }
+                    ui.separator();
+                    if ui
+                        .button(tr(lang, T::SaveCopy))
+                        .on_hover_text(tr(lang, T::SaveCopyHover))
+                        .clicked()
+                    {
+                        self.save(false);
+                    }
+                    if ui
+                        .button(RichText::new(tr(lang, T::Overwrite)).color(pal.warn))
+                        .on_hover_text(tr(lang, T::OverwriteHover))
+                        .clicked()
+                    {
+                        self.confirm_overwrite = true;
+                    }
+                });
             });
         }
-        if !self.status.is_empty() {
-            ui.label(RichText::new(&self.status).italics().weak());
-        }
+        ui.add_space(2.0);
     }
 
     fn grid_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -945,129 +1465,284 @@ impl CbzApp {
         let drag_uid = self.drag_page;
         let n = self.pages.len();
         let lang = self.lang;
-        egui::ScrollArea::vertical().drag_to_scroll(false).auto_shrink([false, false]).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (idx, page) in self.pages.iter_mut().enumerate() {
-                    let card = ui.allocate_ui(Vec2::new(178.0, 252.0), |ui| {
-                        egui::Frame::group(ui.style())
-                            .fill(if Some(page.uid) == drag_uid {
-                                Color32::from_rgb(28, 60, 42)
-                            } else if page.delete {
-                                Color32::from_rgb(60, 30, 30)
-                            } else {
-                                ui.style().visuals.faint_bg_color
-                            })
-                            .show(ui, |ui| {
-                                ui.set_width(156.0);
-                                ui.set_height(230.0);
-                                ui.vertical_centered(|ui| {
-                                    let thumb = match &page.thumb {
-                                        Some(tex) => {
-                                            let sz = fit(tex.size(), Vec2::new(150.0, 150.0));
-                                            ui.add(egui::Image::new(SizedTexture::new(tex.id(), sz)).sense(Sense::click_and_drag()))
-                                        }
-                                        None if page.failed => {
-                                            // Image non décodable : cadre cliquable (clic droit/déplacer
-                                            // restent possibles) plutôt qu'un spinner qui tourne sans fin.
-                                            let (rect, resp) = ui.allocate_exact_size(
-                                                Vec2::new(150.0, 150.0),
+        let pal = pal(ctx);
+        if n == 0 {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new(tr(lang, T::NoImages)).size(18.0).weak());
+            });
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .drag_to_scroll(false)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // Défilement automatique quand on glisse une page près du bord haut/bas :
+                // permet de la déplacer loin sans lâcher.
+                if drag_uid.is_some() {
+                    if let Some(p) = ctx.pointer_hover_pos() {
+                        let clip = ui.clip_rect();
+                        let margin = 60.0;
+                        let dy = if p.y < clip.top() + margin {
+                            clip.top() + margin - p.y
+                        } else if p.y > clip.bottom() - margin {
+                            clip.bottom() - margin - p.y
+                        } else {
+                            0.0
+                        };
+                        if dy != 0.0 {
+                            ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-margin, margin) * 0.3));
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+                // Grille en rangées explicites (horizontal_wrapped décalait la 1re carte
+                // de chaque rangée de quelques pixels).
+                let gap = ui.spacing().item_spacing.x;
+                let cols = (((ui.available_width() + gap) / (178.0 + gap)).floor() as usize).max(1);
+                for row in (0..n).step_by(cols) {
+                    ui.horizontal(|ui| {
+                        for (idx, page) in self.pages.iter().enumerate().skip(row).take(cols) {
+                            let card = ui.allocate_ui(Vec2::new(178.0, 222.0), |ui| {
+                                egui::Frame::group(ui.style())
+                                    .fill(if Some(page.uid) == drag_uid {
+                                        pal.drag_fill
+                                    } else if page.delete {
+                                        pal.del_fill
+                                    } else {
+                                        ui.style().visuals.faint_bg_color
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_width(156.0);
+                                        ui.set_height(200.0);
+                                        ui.vertical_centered(|ui| {
+                                            // Emplacement fixe 150×150 quel que soit le format de la page :
+                                            // noms et boutons restent alignés d'une carte à l'autre.
+                                            let thumb = ui.allocate_response(
+                                                Vec2::splat(150.0),
                                                 Sense::click_and_drag(),
                                             );
-                                            let p = ui.painter();
-                                            p.rect_filled(rect, 4.0, Color32::from_rgb(54, 40, 40));
-                                            p.text(
-                                                rect.center(),
-                                                Align2::CENTER_CENTER,
-                                                tr(lang, T::Illegible),
-                                                FontId::proportional(15.0),
-                                                Color32::from_rgb(210, 170, 170),
-                                            );
-                                            resp
-                                        }
-                                        None => ui.add_sized(Vec2::new(150.0, 150.0), egui::Spinner::new()),
-                                    };
-                                    if thumb.clicked() {
-                                        action = Some(GridAction::Enlarge(idx));
-                                    }
-                                    if thumb.dragged() {
-                                        dragged_uid = Some(page.uid);
-                                    }
-                                    if thumb.drag_stopped() {
-                                        dragged_uid = Some(page.uid);
-                                        released = true;
-                                    }
-                                    thumb
-                                        .on_hover_text(tr(lang, T::ThumbHover))
-                                        .context_menu(|ui| {
-                                            if ui.button(tr(lang, T::MenuEnlarge)).clicked() {
+                                            let slot = thumb.rect;
+                                            match &page.thumb {
+                                                Some(tex) => {
+                                                    let r = Rect::from_center_size(
+                                                        slot.center(),
+                                                        fit(tex.size(), slot.size()),
+                                                    );
+                                                    // Page cochée pour suppression : miniature assombrie.
+                                                    let tint = if page.delete {
+                                                        Color32::from_gray(90)
+                                                    } else {
+                                                        Color32::WHITE
+                                                    };
+                                                    ui.painter().image(
+                                                        tex.id(),
+                                                        r,
+                                                        Rect::from_min_max(
+                                                            Pos2::ZERO,
+                                                            Pos2::new(1.0, 1.0),
+                                                        ),
+                                                        tint,
+                                                    );
+                                                }
+                                                None if page.failed => {
+                                                    // Image non décodable : cadre cliquable (clic droit/déplacer
+                                                    // restent possibles) plutôt qu'un spinner qui tourne sans fin.
+                                                    let p = ui.painter();
+                                                    p.rect_filled(slot, 4.0, pal.bad_fill);
+                                                    p.text(
+                                                        slot.center(),
+                                                        Align2::CENTER_CENTER,
+                                                        tr(lang, T::Illegible),
+                                                        FontId::proportional(15.0),
+                                                        pal.bad_text,
+                                                    );
+                                                }
+                                                None => egui::Spinner::new().paint_at(
+                                                    ui,
+                                                    Rect::from_center_size(
+                                                        slot.center(),
+                                                        Vec2::splat(28.0),
+                                                    ),
+                                                ),
+                                            }
+                                            if page.delete {
+                                                ui.painter().text(
+                                                    thumb.rect.center(),
+                                                    Align2::CENTER_CENTER,
+                                                    "🗑",
+                                                    FontId::proportional(40.0),
+                                                    pal.danger,
+                                                );
+                                            }
+                                            if thumb.clicked() {
                                                 action = Some(GridAction::Enlarge(idx));
-                                                ui.close_menu();
                                             }
-                                            ui.separator();
-                                            if ui.button(tr(lang, T::MenuSplit)).clicked() {
-                                                action = Some(GridAction::Split(idx));
-                                                ui.close_menu();
+                                            if thumb.dragged() {
+                                                dragged_uid = Some(page.uid);
                                             }
-                                            if ui.add_enabled(idx + 1 < n, egui::Button::new(tr(lang, T::MenuMerge))).clicked() {
-                                                action = Some(GridAction::MergeNext(idx));
-                                                ui.close_menu();
+                                            if thumb.drag_stopped() {
+                                                dragged_uid = Some(page.uid);
+                                                released = true;
                                             }
-                                            ui.separator();
-                                            if ui.button(tr(lang, T::MenuInsertBefore)).clicked() {
-                                                action = Some(GridAction::InsertBefore(idx));
-                                                ui.close_menu();
+                                            thumb
+                                                .on_hover_text(tr(lang, T::ThumbHover))
+                                                .context_menu(|ui| {
+                                                    if ui.button(tr(lang, T::MenuEnlarge)).clicked()
+                                                    {
+                                                        action = Some(GridAction::Enlarge(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    let del_lbl = if page.delete {
+                                                        T::MenuKeep
+                                                    } else {
+                                                        T::MenuDelete
+                                                    };
+                                                    if ui.button(tr(lang, del_lbl)).clicked() {
+                                                        action =
+                                                            Some(GridAction::ToggleDelete(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    ui.separator();
+                                                    if ui.button(tr(lang, T::MenuCrop)).clicked() {
+                                                        action = Some(GridAction::Crop(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button(tr(lang, T::MenuSplit)).clicked() {
+                                                        action = Some(GridAction::Split(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui
+                                                        .add_enabled(
+                                                            idx + 1 < n,
+                                                            egui::Button::new(tr(
+                                                                lang,
+                                                                T::MenuMerge,
+                                                            )),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        action = Some(GridAction::MergeNext(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    ui.separator();
+                                                    if ui
+                                                        .button(tr(lang, T::MenuInsertBefore))
+                                                        .clicked()
+                                                    {
+                                                        action =
+                                                            Some(GridAction::InsertBefore(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui
+                                                        .button(tr(lang, T::MenuInsertAfter))
+                                                        .clicked()
+                                                    {
+                                                        action = Some(GridAction::InsertAfter(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    ui.separator();
+                                                    if ui
+                                                        .add_enabled(
+                                                            idx > 0,
+                                                            egui::Button::new(tr(
+                                                                lang,
+                                                                T::MenuMoveStart,
+                                                            )),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        action = Some(GridAction::MoveStart(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui
+                                                        .add_enabled(
+                                                            idx + 1 < n,
+                                                            egui::Button::new(tr(
+                                                                lang,
+                                                                T::MenuMoveEnd,
+                                                            )),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        action = Some(GridAction::MoveEnd(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    ui.separator();
+                                                    if ui.button(tr(lang, T::MenuExtract)).clicked()
+                                                    {
+                                                        action = Some(GridAction::Extract(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui
+                                                        .button(tr(lang, T::MenuMarkIdentical))
+                                                        .on_hover_text(tr(
+                                                            lang,
+                                                            T::MenuMarkIdenticalHover,
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        action =
+                                                            Some(GridAction::MarkIdentical(idx));
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            // Numéro de page (repère des messages « page N ») + nom du fichier.
+                                            let mut name = RichText::new(format!(
+                                                "{} · {}",
+                                                idx + 1,
+                                                short_name(&page.name)
+                                            ))
+                                            .small();
+                                            if page.delete {
+                                                name = name.strikethrough().color(pal.danger);
                                             }
-                                            if ui.button(tr(lang, T::MenuInsertAfter)).clicked() {
-                                                action = Some(GridAction::InsertAfter(idx));
-                                                ui.close_menu();
-                                            }
-                                            ui.separator();
-                                            if ui.button(tr(lang, T::MenuMoveStart)).clicked() {
-                                                action = Some(GridAction::MoveStart(idx));
-                                                ui.close_menu();
-                                            }
-                                            if ui.button(tr(lang, T::MenuMoveEnd)).clicked() {
-                                                action = Some(GridAction::MoveEnd(idx));
-                                                ui.close_menu();
-                                            }
-                                            ui.separator();
-                                            if ui.button(tr(lang, T::MenuExtract)).clicked() {
-                                                action = Some(GridAction::Extract(idx));
-                                                ui.close_menu();
-                                            }
-                                            ui.separator();
-                                            if ui
-                                                .button(tr(lang, T::MenuMarkIdentical))
-                                                .on_hover_text(tr(lang, T::MenuMarkIdenticalHover))
-                                                .clicked()
-                                            {
-                                                action = Some(GridAction::MarkIdentical(idx));
-                                                ui.close_menu();
-                                            }
+                                            ui.label(name).on_hover_text(&page.name);
+                                            ui.horizontal(|ui| {
+                                                let lbl = if page.delete { "↩" } else { "🗑" };
+                                                if ui
+                                                    .button(lbl)
+                                                    .on_hover_text(if page.delete {
+                                                        tr(lang, T::KeepHover)
+                                                    } else {
+                                                        tr(lang, T::DeleteHover)
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    action = Some(GridAction::ToggleDelete(idx));
+                                                }
+                                                if ui
+                                                    .button("✂")
+                                                    .on_hover_text(tr(lang, T::CropToCoverHover))
+                                                    .clicked()
+                                                {
+                                                    action = Some(GridAction::Crop(idx));
+                                                }
+                                                if ui
+                                                    .add_enabled(idx > 0, egui::Button::new("◀"))
+                                                    .on_hover_text(tr(lang, T::MoveBeforeHover))
+                                                    .clicked()
+                                                {
+                                                    action = Some(GridAction::MoveLeft(idx));
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        idx + 1 < n,
+                                                        egui::Button::new("▶"),
+                                                    )
+                                                    .on_hover_text(tr(lang, T::MoveAfterHover))
+                                                    .clicked()
+                                                {
+                                                    action = Some(GridAction::MoveRight(idx));
+                                                }
+                                            });
                                         });
-                                    ui.label(RichText::new(short_name(&page.name)).small());
-                                    ui.horizontal(|ui| {
-                                        let lbl = if page.delete { "↩" } else { "🗑" };
-                                        if ui.button(lbl).on_hover_text(if page.delete { tr(lang, T::KeepHover) } else { tr(lang, T::DeleteHover) }).clicked() {
-                                            page.delete = !page.delete;
-                                        }
-                                        if ui.button("✂").on_hover_text(tr(lang, T::CropToCoverHover)).clicked() {
-                                            action = Some(GridAction::Crop(idx));
-                                        }
-                                        if ui.add_enabled(idx > 0, egui::Button::new("◀")).on_hover_text(tr(lang, T::MoveBeforeHover)).clicked() {
-                                            action = Some(GridAction::MoveLeft(idx));
-                                        }
-                                        if ui.add_enabled(idx + 1 < n, egui::Button::new("▶")).on_hover_text(tr(lang, T::MoveAfterHover)).clicked() {
-                                            action = Some(GridAction::MoveRight(idx));
-                                        }
                                     });
-                                });
                             });
+                            rects.push((idx, card.response.rect));
+                        }
                     });
-                    rects.push((idx, card.response.rect));
                 }
             });
-        });
         self.card_rects = rects;
 
         // déplacement interne d'une page par glisser (avec barre à la position cible)
@@ -1082,9 +1757,27 @@ impl CbzApp {
             } else {
                 self.drag_page = Some(uid);
                 if let Some(p) = pos {
+                    let painter =
+                        ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("reorder")));
                     if let Some(m) = self.insert_marker(self.drop_index(p)) {
-                        ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("reorder")))
-                            .rect_filled(m, 2.0, Color32::from_rgb(40, 210, 130));
+                        painter.rect_filled(m, 2.0, pal.accent);
+                    }
+                    // « Fantôme » de la page déplacée sous le curseur.
+                    if let Some(tex) = self
+                        .pages
+                        .iter()
+                        .find(|pg| pg.uid == uid)
+                        .and_then(|pg| pg.thumb.as_ref())
+                    {
+                        let sz = fit(tex.size(), Vec2::new(80.0, 80.0));
+                        let r = Rect::from_min_size(p + Vec2::new(12.0, 12.0), sz);
+                        painter.image(
+                            tex.id(),
+                            r,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::from_white_alpha(190),
+                        );
+                        painter.rect_stroke(r, 0.0, Stroke::new(1.5, pal.accent));
                     }
                 }
             }
@@ -1093,40 +1786,47 @@ impl CbzApp {
         }
 
         match action {
+            Some(GridAction::ToggleDelete(i)) => self.toggle_delete(i),
             Some(GridAction::Enlarge(i)) => self.open_viewer(i),
             Some(GridAction::Crop(i)) => self.enter_crop(i, ctx),
-            Some(GridAction::MoveLeft(i)) if i > 0 => {
+            Some(GridAction::MoveLeft(i)) if i > 0 && i < self.pages.len() => {
+                self.checkpoint();
                 self.pages.swap(i, i - 1);
                 self.dirty_order = true;
             }
             Some(GridAction::MoveRight(i)) if i + 1 < self.pages.len() => {
+                self.checkpoint();
                 self.pages.swap(i, i + 1);
                 self.dirty_order = true;
             }
-            Some(GridAction::MoveStart(i)) if i < self.pages.len() => {
+            Some(GridAction::MoveStart(i)) if i > 0 && i < self.pages.len() => {
+                self.checkpoint();
                 let p = self.pages.remove(i);
                 self.pages.insert(0, p);
                 self.dirty_order = true;
             }
-            Some(GridAction::MoveEnd(i)) if i < self.pages.len() => {
+            Some(GridAction::MoveEnd(i)) if i + 1 < self.pages.len() => {
+                self.checkpoint();
                 let p = self.pages.remove(i);
                 self.pages.push(p);
                 self.dirty_order = true;
             }
             Some(GridAction::InsertBefore(i)) => {
                 if let Some(pg) = self.pick_image_page() {
+                    self.checkpoint();
                     let at = i.min(self.pages.len());
                     self.pages.insert(at, pg);
                     self.dirty_order = true;
-                    self.status = tr(lang, T::ImageInserted).to_string();
+                    self.info(tr(lang, T::ImageInserted));
                 }
             }
             Some(GridAction::InsertAfter(i)) => {
                 if let Some(pg) = self.pick_image_page() {
+                    self.checkpoint();
                     let at = (i + 1).min(self.pages.len());
                     self.pages.insert(at, pg);
                     self.dirty_order = true;
-                    self.status = tr(lang, T::ImageInserted).to_string();
+                    self.info(tr(lang, T::ImageInserted));
                 }
             }
             Some(GridAction::MergeNext(i)) => self.merge_next(i),
@@ -1140,14 +1840,18 @@ impl CbzApp {
     fn move_page_to(&mut self, uid: u64, target: usize) {
         if let Some(src) = self.pages.iter().position(|p| p.uid == uid) {
             let mut t = target.min(self.pages.len());
-            let page = self.pages.remove(src);
             if src < t {
                 t -= 1;
             }
+            if t == src {
+                return; // lâchée à sa place : rien à faire (pas d'« ordre modifié »)
+            }
+            self.checkpoint();
+            let page = self.pages.remove(src);
             t = t.min(self.pages.len());
             self.pages.insert(t, page);
             self.dirty_order = true;
-            self.status = tr(self.lang, T::PageMoved).to_string();
+            self.info(tr(self.lang, T::PageMoved).replace("{n}", &(t + 1).to_string()));
         }
     }
 
@@ -1163,6 +1867,7 @@ impl CbzApp {
         }
         let mut va = VAct::None;
         let lang = self.lang;
+        let pal = pal(ctx);
         if let Some(vs) = self.viewer.as_mut() {
             if vs.tex.is_none() && !vs.failed {
                 if let Some(page) = self.pages.get(vs.idx) {
@@ -1179,21 +1884,39 @@ impl CbzApp {
                 .get(idx)
                 .map(|p| (p.name.clone(), p.delete))
                 .unwrap_or_default();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button(tr(lang, T::ViewerClose)).clicked() {
                     va = VAct::Close;
                 }
                 ui.separator();
-                if ui.add_enabled(idx > 0, egui::Button::new(tr(lang, T::ViewerPrev))).clicked() {
+                if ui
+                    .add_enabled(idx > 0, egui::Button::new(tr(lang, T::ViewerPrev)))
+                    .on_hover_text("⬅")
+                    .clicked()
+                {
                     va = VAct::Prev;
                 }
                 ui.label(RichText::new(format!("{} / {}", idx + 1, total)).strong());
-                if ui.add_enabled(idx + 1 < total, egui::Button::new(tr(lang, T::ViewerNext))).clicked() {
+                if ui
+                    .add_enabled(idx + 1 < total, egui::Button::new(tr(lang, T::ViewerNext)))
+                    .on_hover_text("➡")
+                    .clicked()
+                {
                     va = VAct::Next;
                 }
                 ui.separator();
-                ui.label(RichText::new(short_name(&name)).weak());
-                if ui.selectable_label(is_del, if is_del { tr(lang, T::ViewerKeep) } else { tr(lang, T::ViewerDelete) }).clicked() {
+                ui.label(RichText::new(short_name(&name)).weak())
+                    .on_hover_text(&name);
+                let del_txt = if is_del {
+                    RichText::new(tr(lang, T::ViewerKeep))
+                } else {
+                    RichText::new(tr(lang, T::ViewerDelete)).color(pal.danger)
+                };
+                if ui
+                    .button(del_txt)
+                    .on_hover_text(tr(lang, T::KeyDel))
+                    .clicked()
+                {
                     va = VAct::ToggleDelete;
                 }
                 if ui.button(tr(lang, T::ViewerCrop)).clicked() {
@@ -1202,15 +1925,50 @@ impl CbzApp {
                 if ui.button(tr(lang, T::ViewerExtract)).clicked() {
                     va = VAct::Extract;
                 }
+                if is_del {
+                    ui.colored_label(pal.danger, tr(lang, T::MarkedForDeletion));
+                }
             });
             ui.separator();
             match &vs.tex {
                 Some(tex) => {
                     let avail = ui.available_size();
-                    let sz = fit(tex.size(), Vec2::new(avail.x, (avail.y - 4.0).max(64.0)));
-                    ui.centered_and_justified(|ui| {
-                        ui.image(SizedTexture::new(tex.id(), sz));
-                    });
+                    let clicked = if vs.zoom {
+                        // Taille réelle : défilement (molette ou glisser) dans les deux sens.
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let r = ui.add(
+                                    egui::Image::new(SizedTexture::new(tex.id(), tex.size_vec2()))
+                                        .sense(Sense::click()),
+                                );
+                                r.clone()
+                                    .on_hover_cursor(CursorIcon::ZoomOut)
+                                    .on_hover_text(tr(lang, T::ZoomHover));
+                                r.clicked()
+                            })
+                            .inner
+                    } else {
+                        let sz = fit(tex.size(), Vec2::new(avail.x, (avail.y - 4.0).max(64.0)));
+                        ui.centered_and_justified(|ui| {
+                            let r = ui.add(
+                                egui::Image::new(SizedTexture::new(tex.id(), sz))
+                                    .sense(Sense::click()),
+                            );
+                            if is_del {
+                                ui.painter()
+                                    .rect_stroke(r.rect, 0.0, Stroke::new(3.0, pal.danger));
+                            }
+                            r.clone()
+                                .on_hover_cursor(CursorIcon::ZoomIn)
+                                .on_hover_text(tr(lang, T::ZoomHover));
+                            r.clicked()
+                        })
+                        .inner
+                    };
+                    if clicked {
+                        vs.zoom = !vs.zoom;
+                    }
                 }
                 None => {
                     let failed = vs.failed;
@@ -1219,7 +1977,7 @@ impl CbzApp {
                             ui.label(
                                 RichText::new(tr(lang, T::IllegibleViewer))
                                     .size(18.0)
-                                    .color(Color32::from_rgb(210, 170, 170)),
+                                    .color(pal.bad_text),
                             );
                         } else {
                             ui.add(egui::Spinner::new());
@@ -1233,11 +1991,8 @@ impl CbzApp {
             VAct::Prev => self.viewer_go(-1),
             VAct::Next => self.viewer_go(1),
             VAct::ToggleDelete => {
-                if let Some(vs) = self.viewer.as_ref() {
-                    let i = vs.idx;
-                    if let Some(p) = self.pages.get_mut(i) {
-                        p.delete = !p.delete;
-                    }
+                if let Some(i) = self.viewer.as_ref().map(|v| v.idx) {
+                    self.toggle_delete(i);
                 }
             }
             VAct::Crop => {
@@ -1246,8 +2001,7 @@ impl CbzApp {
                 }
             }
             VAct::Extract => {
-                if let Some(vs) = self.viewer.as_ref() {
-                    let i = vs.idx;
+                if let Some(i) = self.viewer.as_ref().map(|v| v.idx) {
                     self.extract_page(i);
                 }
             }
@@ -1265,29 +2019,49 @@ impl CbzApp {
         }
         let mut act = Act::None;
         let lang = self.lang;
+        let pal = pal(ctx);
         if let Some(cs) = self.crop.as_mut() {
-            let pname = self.pages.get(cs.idx).map(|p| p.name.clone()).unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(tr(lang, T::CropTitle).replace("{pname}", &pname)).strong());
-            });
+            let pname = self
+                .pages
+                .get(cs.idx)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(tr(lang, T::CropTitle).replace("{pname}", &short_name(&pname)))
+                    .strong(),
+            );
             ui.label(tr(lang, T::CropHint2));
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(tr(lang, T::CropApply)).color(Color32::from_rgb(120, 200, 120))).clicked() {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        cs.sel.is_some(),
+                        egui::Button::new(RichText::new(tr(lang, T::CropApply)).color(pal.ok)),
+                    )
+                    .on_hover_text(tr(lang, T::KeyEnter))
+                    .clicked()
+                {
                     act = Act::Validate;
                 }
                 if ui.button(tr(lang, T::CropWhole)).clicked() {
                     act = Act::Whole;
                 }
-                if ui.button(tr(lang, T::Cancel)).clicked() {
+                if ui
+                    .button(tr(lang, T::Cancel))
+                    .on_hover_text(tr(lang, T::KeyEsc))
+                    .clicked()
+                {
                     act = Act::Cancel;
                 }
                 if let Some([x, y, w, h]) = cs.sel {
                     ui.label(
-                        tr(lang, T::SelectionInfo)
-                            .replace("{w}", &w.to_string())
-                            .replace("{h}", &h.to_string())
-                            .replace("{x}", &x.to_string())
-                            .replace("{y}", &y.to_string()),
+                        RichText::new(
+                            tr(lang, T::SelectionInfo)
+                                .replace("{w}", &w.to_string())
+                                .replace("{h}", &h.to_string())
+                                .replace("{x}", &x.to_string())
+                                .replace("{y}", &y.to_string()),
+                        )
+                        .weak(),
                     );
                 }
             });
@@ -1302,16 +2076,25 @@ impl CbzApp {
             );
             let (resp, painter) = ui.allocate_painter(disp, Sense::drag());
             let area = resp.rect;
-            painter.image(cs.tex.id(), area, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            painter.image(
+                cs.tex.id(),
+                area,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
 
-            let sel_screen = cs.sel.map(|s| img_to_screen(s, area, img_w as f32, img_h as f32));
+            let sel_screen = cs
+                .sel
+                .map(|s| img_to_screen(s, area, img_w as f32, img_h as f32));
 
             if cs.drag.is_none() {
-                if let (Some(scr), Some(hp)) = (sel_screen, resp.hover_pos()) {
-                    if let Some(h) = handle_at(scr, hp, 10.0) {
-                        ctx.set_cursor_icon(resize_cursor(h));
-                    } else if scr.contains(hp) {
-                        ctx.set_cursor_icon(CursorIcon::Move);
+                if let Some(hp) = resp.hover_pos() {
+                    match sel_screen {
+                        Some(scr) if handle_at(scr, hp, 10.0).is_some() => ctx.set_cursor_icon(
+                            resize_cursor(handle_at(scr, hp, 10.0).unwrap_or(Handle::SE)),
+                        ),
+                        Some(scr) if scr.contains(hp) => ctx.set_cursor_icon(CursorIcon::Move),
+                        _ => ctx.set_cursor_icon(CursorIcon::Crosshair),
                     }
                 }
             }
@@ -1339,11 +2122,13 @@ impl CbzApp {
                     let new_screen = match kind {
                         DragKind::New => Rect::from_two_pos(cs.press, cur),
                         DragKind::Move => {
-                            let base = img_to_screen(cs.sel_press, area, img_w as f32, img_h as f32);
+                            let base =
+                                img_to_screen(cs.sel_press, area, img_w as f32, img_h as f32);
                             translate_clamped(base, cur - cs.press, area)
                         }
                         DragKind::Resize(h) => {
-                            let base = img_to_screen(cs.sel_press, area, img_w as f32, img_h as f32);
+                            let base =
+                                img_to_screen(cs.sel_press, area, img_w as f32, img_h as f32);
                             apply_resize(base, h, cur, area)
                         }
                     }
@@ -1359,12 +2144,39 @@ impl CbzApp {
 
             if let Some(s) = cs.sel {
                 let scr = img_to_screen(s, area, img_w as f32, img_h as f32);
-                painter.rect_filled(scr, 0.0, Color32::from_rgba_unmultiplied(0, 130, 255, 25));
-                painter.rect_stroke(scr, 0.0, Stroke::new(2.0, Color32::from_rgb(0, 160, 255)));
+                // Assombrir ce qui sera rogné : on voit directement le résultat.
+                let shade = Color32::from_black_alpha(140);
+                painter.rect_filled(
+                    Rect::from_min_max(area.min, Pos2::new(area.right(), scr.top())),
+                    0.0,
+                    shade,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(area.left(), scr.bottom()), area.max),
+                    0.0,
+                    shade,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(area.left(), scr.top()),
+                        Pos2::new(scr.left(), scr.bottom()),
+                    ),
+                    0.0,
+                    shade,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(scr.right(), scr.top()),
+                        Pos2::new(area.right(), scr.bottom()),
+                    ),
+                    0.0,
+                    shade,
+                );
+                painter.rect_stroke(scr, 0.0, Stroke::new(2.0, pal.accent));
                 for (_, hp) in handles(scr) {
                     let hr = Rect::from_center_size(hp, Vec2::splat(9.0));
                     painter.rect_filled(hr, 0.0, Color32::WHITE);
-                    painter.rect_stroke(hr, 0.0, Stroke::new(1.0, Color32::from_rgb(0, 120, 200)));
+                    painter.rect_stroke(hr, 0.0, Stroke::new(1.0, pal.accent));
                 }
             }
         }
@@ -1378,100 +2190,310 @@ impl CbzApp {
             Act::None => {}
         }
     }
+
+    // Raccourcis clavier (désactivés quand une boîte de confirmation est ouverte).
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        use egui::Modifiers;
+        // Ctrl+Maj+Z d'abord : `consume_key(COMMAND, Z)` accepterait aussi Maj.
+        let (open, save, redo2, undo, redo) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::COMMAND, Key::O),
+                i.consume_key(Modifiers::COMMAND, Key::S),
+                i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z),
+                i.consume_key(Modifiers::COMMAND, Key::Z),
+                i.consume_key(Modifiers::COMMAND, Key::Y),
+            )
+        });
+        let (esc, enter, left, right, home, end, del, shift) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::Escape),
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::ArrowLeft),
+                i.key_pressed(Key::ArrowRight),
+                i.key_pressed(Key::Home),
+                i.key_pressed(Key::End),
+                i.key_pressed(Key::Delete),
+                i.modifiers.shift,
+            )
+        });
+        if open {
+            self.request_open(None);
+        }
+        let in_crop_or_split = self.crop.is_some() || self.split.is_some();
+        if save && self.path.is_some() && !in_crop_or_split {
+            self.save(false);
+        }
+        if !in_crop_or_split {
+            if undo {
+                self.undo();
+            }
+            if redo || redo2 {
+                self.redo();
+            }
+        }
+
+        if self.viewer.is_some() {
+            if esc {
+                self.viewer = None;
+            } else {
+                if left {
+                    self.viewer_go(-1);
+                }
+                if right {
+                    self.viewer_go(1);
+                }
+                if home {
+                    self.viewer_go(i32::MIN / 2);
+                }
+                if end {
+                    self.viewer_go(i32::MAX / 2);
+                }
+                if del {
+                    if let Some(i) = self.viewer.as_ref().map(|v| v.idx) {
+                        self.toggle_delete(i);
+                    }
+                }
+            }
+        } else if let Some(ss) = self.split.as_mut() {
+            if esc {
+                self.split = None;
+                self.status.clear();
+            } else if enter {
+                self.finish_split();
+            } else if left || right {
+                // Ajustement fin de la ligne de coupe (Maj = pas plus grand).
+                let step = if shift { 20 } else { 2 };
+                let w = ss.img.width();
+                let c = ss.cut as i64 + if left { -step } else { step };
+                ss.cut = c.clamp(1, (w as i64 - 1).max(1)) as u32;
+            }
+        } else if self.crop.is_some() {
+            if esc {
+                self.crop = None;
+                self.status.clear();
+            } else if enter && self.crop.as_ref().is_some_and(|c| c.sel.is_some()) {
+                self.finish_crop(false, ctx);
+            }
+        }
+    }
+
+    // Dépôt de fichiers depuis le gestionnaire de fichiers.
+    fn handle_drops(&mut self, ctx: &egui::Context, now: f64) {
+        let lang = self.lang;
+        // (chemin, octets si pas de chemin, nom) de chaque fichier déposé
+        type Dropped = (Option<PathBuf>, Option<Arc<[u8]>>, String);
+        let dropped: Vec<Dropped> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| (f.path.clone(), f.bytes.clone(), f.name.clone()))
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if let Some(p) = dropped
+            .iter()
+            .find_map(|(p, _, _)| p.clone().filter(|p| is_cbz_path(p)))
+        {
+            self.request_open(Some(p));
+            return;
+        }
+        let in_grid = self.path.is_some()
+            && self.crop.is_none()
+            && self.split.is_none()
+            && self.viewer.is_none();
+        if !in_grid {
+            if self.path.is_some() {
+                self.fail(tr(lang, T::DropOnlyInGrid));
+            }
+            return;
+        }
+        // Une image externe s'insère toujours en page 1 (sous X11 la position d'un
+        // drag externe n'est pas fiable) + petit toast.
+        let mut new_pages = Vec::new();
+        for (path, bytes, name) in &dropped {
+            let ext = path
+                .as_ref()
+                .and_then(|p| p.extension())
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .or_else(|| {
+                    Path::new(name)
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                })
+                .unwrap_or_default();
+            if !is_image_ext(&ext) {
+                continue;
+            }
+            let data: Option<Arc<[u8]>> = match path {
+                Some(p) => std::fs::read(p).ok().map(Into::into),
+                None => bytes.clone(),
+            };
+            if let Some(data) = data {
+                let nm = path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| name.clone());
+                let uid = self.new_uid();
+                new_pages.push(Page::new(nm, data, uid));
+            }
+        }
+        let count = new_pages.len();
+        if count == 0 {
+            self.fail(tr(lang, T::DropNothingUsable));
+            return;
+        }
+        self.checkpoint();
+        self.pages.splice(0..0, new_pages);
+        self.dirty_order = true;
+        let msg = if count == 1 {
+            tr(lang, T::ToastImageAdded).to_string()
+        } else {
+            tr(lang, T::ToastImagesAdded).replace("{count}", &count.to_string())
+        };
+        self.info(msg.clone());
+        self.toast = Some((msg, now + TOAST_SECS));
+    }
+
+    // Boîtes de confirmation (écrasement, modifications non enregistrées).
+    fn dialogs_ui(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
+        let pal = pal(ctx);
+        let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+        if self.confirm_overwrite {
+            let mut close = esc;
+            egui::Window::new(tr(lang, T::ConfirmTitle))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(tr(lang, T::ConfirmLine1));
+                    ui.label(tr(lang, T::ConfirmLine2));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new(tr(lang, T::ConfirmYes)).color(pal.warn))
+                            .clicked()
+                        {
+                            close = true;
+                            self.save(true);
+                        }
+                        if ui.button(tr(lang, T::CancelPlain)).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.confirm_overwrite = false;
+            }
+        }
+        if self.confirm_discard.is_some() {
+            let mut choice: Option<bool> = if esc { Some(false) } else { None }; // true = continuer
+            egui::Window::new(tr(lang, T::DiscardTitle))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(tr(lang, T::DiscardLine));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(lang, T::SaveCopyFirst)).clicked() && self.save(false) {
+                            choice = Some(true);
+                        }
+                        if ui
+                            .button(RichText::new(tr(lang, T::DiscardYes)).color(pal.warn))
+                            .clicked()
+                        {
+                            choice = Some(true);
+                        }
+                        if ui.button(tr(lang, T::CancelPlain)).clicked() {
+                            choice = Some(false);
+                        }
+                    });
+                });
+            match choice {
+                Some(true) => match self.confirm_discard.take() {
+                    Some(Pending::Open(p)) => self.do_open(p),
+                    Some(Pending::Quit) => {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    None => {}
+                },
+                Some(false) => self.confirm_discard = None,
+                None => {}
+            }
+        }
+    }
 }
 
 impl eframe::App for CbzApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = ctx.input(|i| i.time);
         let lang = self.lang;
-        // clavier : Échap = retour ; flèches = naviguer en mode agrandi
-        let (esc, left, right) = ctx.input(|i| {
-            (
-                i.key_pressed(Key::Escape),
-                i.key_pressed(Key::ArrowLeft),
-                i.key_pressed(Key::ArrowRight),
-            )
-        });
-        if esc {
-            if self.viewer.is_some() {
-                self.viewer = None;
-            } else if self.split.is_some() {
-                self.split = None;
-                self.status.clear();
-            } else if self.crop.is_some() {
-                self.crop = None;
-                self.status.clear();
-            }
-        } else if self.viewer.is_some() {
-            if left {
-                self.viewer_go(-1);
-            }
-            if right {
-                self.viewer_go(1);
-            }
+        let pal = pal(ctx);
+
+        // Fermeture de la fenêtre avec des modifications non enregistrées : demander.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.is_modified()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_discard = Some(Pending::Quit);
         }
 
-        // glisser-déposer : un .cbz s'ouvre ; une image externe s'insère toujours en
-        // page 1 (sous X11 la position d'un drag externe n'est pas fiable) + petit toast.
-        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        let dropped: Vec<(Option<PathBuf>, Option<std::sync::Arc<[u8]>>, String)> = ctx.input(|i| {
-            i.raw.dropped_files.iter().map(|f| (f.path.clone(), f.bytes.clone(), f.name.clone())).collect()
-        });
-        if !dropped.is_empty() {
-            if let Some(p) = dropped.iter().find_map(|(p, _, _)| p.clone().filter(|p| is_cbz_path(p))) {
-                self.open_cbz(p);
-            } else if self.path.is_some() && self.crop.is_none() && self.split.is_none() && self.viewer.is_none() {
-                let mut at = 0usize; // les images déposées vont toujours en tête (page 1)
-                let mut count = 0;
-                for (path, bytes, name) in &dropped {
-                    let ext = path
-                        .as_ref()
-                        .and_then(|p| p.extension())
-                        .map(|e| e.to_string_lossy().to_lowercase())
-                        .or_else(|| Path::new(name).extension().map(|e| e.to_string_lossy().to_lowercase()))
-                        .unwrap_or_default();
-                    if !is_image_ext(&ext) {
-                        continue;
-                    }
-                    let data = match path {
-                        Some(p) => std::fs::read(p).ok(),
-                        None => bytes.as_ref().map(|b| b.to_vec()),
-                    };
-                    if let Some(data) = data {
-                        let uid = self.next_uid;
-                        self.next_uid += 1;
-                        let nm = path
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| name.clone());
-                        let at_clamped = at.min(self.pages.len());
-                        self.pages.insert(
-                            at_clamped,
-                            Page { name: nm, bytes: data, thumb: None, failed: false, delete: false, uid },
-                        );
-                        at = at_clamped + 1;
-                        count += 1;
-                    }
-                }
-                if count > 0 {
-                    self.dirty_order = true;
-                    let msg = if count == 1 {
-                        tr(lang, T::ToastImageAdded).to_string()
-                    } else {
-                        tr(lang, T::ToastImagesAdded).replace("{count}", &count.to_string())
-                    };
-                    self.status = msg.clone();
-                    self.toast = Some((msg, now + TOAST_SECS));
-                }
-            }
+        let modal = self.confirm_overwrite || self.confirm_discard.is_some();
+        if !modal {
+            self.handle_keys(ctx);
+            self.handle_drops(ctx, now);
         }
-
         self.generate_thumbnails(ctx);
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_ui(ui));
+        // Titre de fenêtre : fichier courant + « ● » s'il reste des modifications.
+        let title = match &self.path {
+            Some(p) => format!(
+                "{}{} — {}",
+                if self.is_modified() { "● " } else { "" },
+                p.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                tr(lang, T::WindowTitle)
+            ),
+            None => tr(lang, T::WindowTitle).to_string(),
+        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            if modal {
+                ui.disable();
+            }
+            self.top_ui(ui, ctx);
+        });
+
+        // Barre d'état en bas : position fixe (la barre du haut ne « saute » plus),
+        // erreurs en rouge.
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let txt = if self.status.is_empty() {
+                    " "
+                } else {
+                    self.status.as_str()
+                };
+                if self.status_err {
+                    ui.colored_label(pal.danger, txt);
+                } else {
+                    ui.label(RichText::new(txt).weak());
+                }
+            });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if modal {
+                ui.disable();
+            }
             if self.viewer.is_some() {
                 self.viewer_ui(ui, ctx);
             } else if self.split.is_some() {
@@ -1487,48 +2509,43 @@ impl eframe::App for CbzApp {
             }
         });
 
-        if hovering {
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) && !modal {
             let p = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("dnd-overlay")));
-            let in_grid = self.path.is_some() && self.crop.is_none() && self.split.is_none() && self.viewer.is_none();
-            if in_grid {
+            let in_grid = self.path.is_some()
+                && self.crop.is_none()
+                && self.split.is_none()
+                && self.viewer.is_none();
+            if in_grid && !self.pages.is_empty() {
                 if let Some(m) = self.insert_marker(0) {
-                    p.rect_filled(m, 2.0, Color32::from_rgb(0, 180, 255));
+                    p.rect_filled(m, 2.0, pal.accent);
                 }
                 let sr = ctx.screen_rect();
-                p.text(
-                    Pos2::new(sr.center().x, sr.top() + 92.0),
-                    Align2::CENTER_CENTER,
-                    tr(lang, T::DropToPage1),
+                let g = p.layout_no_wrap(
+                    tr(lang, T::DropToPage1).to_string(),
                     FontId::proportional(20.0),
-                    Color32::from_rgb(0, 180, 255),
+                    Color32::WHITE,
                 );
+                let r = Rect::from_center_size(
+                    Pos2::new(sr.center().x, sr.top() + 110.0),
+                    g.size() + Vec2::new(28.0, 16.0),
+                );
+                p.rect_filled(r, 10.0, Color32::from_rgba_unmultiplied(20, 22, 26, 235));
+                p.rect_stroke(r, 10.0, Stroke::new(1.5, pal.accent));
+                p.galley(r.center() - g.size() / 2.0, g, Color32::WHITE);
             } else {
                 let r = ctx.screen_rect();
                 p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 130));
-                p.text(r.center(), Align2::CENTER_CENTER, tr(lang, T::DropCbzHere), FontId::proportional(30.0), Color32::WHITE);
+                p.text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    tr(lang, T::DropCbzHere),
+                    FontId::proportional(30.0),
+                    Color32::WHITE,
+                );
             }
         }
 
-        if self.confirm_overwrite {
-            egui::Window::new(tr(lang, T::ConfirmTitle))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(tr(lang, T::ConfirmLine1));
-                    ui.label(tr(lang, T::ConfirmLine2));
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(RichText::new(tr(lang, T::ConfirmYes)).color(Color32::from_rgb(230, 160, 60))).clicked() {
-                            self.confirm_overwrite = false;
-                            self.save(true);
-                        }
-                        if ui.button(tr(lang, T::CancelPlain)).clicked() {
-                            self.confirm_overwrite = false;
-                        }
-                    });
-                });
-        }
+        self.dialogs_ui(ctx);
 
         // Petit message éphémère qui disparaît tout seul (≈ TOAST_SECS secondes).
         if let Some((msg, exp)) = self.toast.clone() {
@@ -1536,14 +2553,14 @@ impl eframe::App for CbzApp {
                 self.toast = None;
             } else {
                 let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("toast")));
-                let galley =
-                    ctx.fonts(|f| f.layout_no_wrap(msg, FontId::proportional(18.0), Color32::WHITE));
+                let galley = ctx
+                    .fonts(|f| f.layout_no_wrap(msg, FontId::proportional(18.0), Color32::WHITE));
                 let sr = ctx.screen_rect();
-                let center = Pos2::new(sr.center().x, sr.bottom() - 64.0);
+                let center = Pos2::new(sr.center().x, sr.bottom() - 72.0);
                 let pad = Vec2::new(18.0, 12.0);
                 let rect = Rect::from_center_size(center, galley.size() + pad * 2.0);
                 painter.rect_filled(rect, 10.0, Color32::from_rgba_unmultiplied(20, 22, 26, 235));
-                painter.rect_stroke(rect, 10.0, Stroke::new(1.5, Color32::from_rgb(0, 180, 255)));
+                painter.rect_stroke(rect, 10.0, Stroke::new(1.5, pal.accent));
                 painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64((exp - now).max(0.0)));
             }
@@ -1557,7 +2574,10 @@ fn img_to_screen(sel: [u32; 4], area: Rect, img_w: f32, img_h: f32) -> Rect {
     let sx = area.width() / img_w.max(1.0);
     let sy = area.height() / img_h.max(1.0);
     Rect::from_min_size(
-        Pos2::new(area.left() + sel[0] as f32 * sx, area.top() + sel[1] as f32 * sy),
+        Pos2::new(
+            area.left() + sel[0] as f32 * sx,
+            area.top() + sel[1] as f32 * sy,
+        ),
         Vec2::new(sel[2] as f32 * sx, sel[3] as f32 * sy),
     )
 }
@@ -1568,8 +2588,12 @@ fn screen_to_img(r: Rect, area: Rect, img_w: u32, img_h: u32) -> [u32; 4] {
     let r = r.intersect(area);
     let x = (((r.left() - area.left()) / sx).round().max(0.0)) as u32;
     let y = (((r.top() - area.top()) / sy).round().max(0.0)) as u32;
-    let w = ((r.width() / sx).round() as u32).min(img_w.saturating_sub(x)).max(1);
-    let h = ((r.height() / sy).round() as u32).min(img_h.saturating_sub(y)).max(1);
+    let w = ((r.width() / sx).round() as u32)
+        .min(img_w.saturating_sub(x))
+        .max(1);
+    let h = ((r.height() / sy).round() as u32)
+        .min(img_h.saturating_sub(y))
+        .max(1);
     [x, y, w, h]
 }
 
@@ -1661,7 +2685,10 @@ fn decode_texture(ctx: &egui::Context, bytes: &[u8], max: u32) -> Option<Texture
         img
     };
     let rgba = img.to_rgba8();
-    let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], rgba.as_raw());
+    let ci = ColorImage::from_rgba_unmultiplied(
+        [img.width() as usize, img.height() as usize],
+        rgba.as_raw(),
+    );
     Some(ctx.load_texture("viewer", ci, TextureOptions::LINEAR))
 }
 
@@ -1675,7 +2702,7 @@ fn fit(size: [usize; 2], max: Vec2) -> Vec2 {
 }
 
 fn is_cbz_path(p: &Path) -> bool {
-    p.extension().map_or(false, |e| {
+    p.extension().is_some_and(|e| {
         let e = e.to_string_lossy().to_lowercase();
         e == "cbz" || e == "zip"
     })
@@ -1715,7 +2742,7 @@ impl Lang {
         for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
             if let Some(v) = std::env::var_os(var) {
                 let v = v.to_string_lossy().to_lowercase();
-                let code = v.split(|c| c == '_' || c == '.' || c == '-').next().unwrap_or("");
+                let code = v.split(['_', '.', '-']).next().unwrap_or("");
                 if let Some(l) = Lang::from_code(code) {
                     return l;
                 }
@@ -1834,6 +2861,34 @@ enum T {
     ConfirmLine2,
     ConfirmYes,
     CancelPlain,
+    ReadError,
+    Undone,
+    Redone,
+    Undo,
+    Redo,
+    UndoHover,
+    RedoHover,
+    CoverRemoved,
+    RemoveCoverHover,
+    NoPagesToSave,
+    OverwrittenBakKept,
+    Unsaved,
+    SaveCopyHover,
+    KeyEnter,
+    KeyEsc,
+    KeyDel,
+    NoImages,
+    MenuKeep,
+    MenuDelete,
+    MenuCrop,
+    MarkedForDeletion,
+    ZoomHover,
+    DropOnlyInGrid,
+    DropNothingUsable,
+    DiscardTitle,
+    DiscardLine,
+    DiscardYes,
+    SaveCopyFirst,
 }
 
 fn tr(lang: Lang, key: T) -> &'static str {
@@ -1847,10 +2902,10 @@ fn tr(lang: Lang, key: T) -> &'static str {
         T::ToDelete => ["· {n} à supprimer", "· {n} to delete", "· {n} a eliminar", "· {n} zu löschen", "· {n} da eliminare"][i],
         T::OrderChanged => ["· ordre modifié", "· order changed", "· orden modificado", "· Reihenfolge geändert", "· ordine modificato"][i],
         T::CoverFlag => ["· couverture ✔", "· cover ✔", "· portada ✔", "· Cover ✔", "· copertina ✔"][i],
-        T::MarkDuplicates => ["🧹 Marquer les doublons", "🧹 Mark duplicates", "🧹 Marcar duplicados", "🧹 Duplikate markieren", "🧹 Segna i doppioni"][i],
+        T::MarkDuplicates => ["🗐 Marquer les doublons", "🗐 Mark duplicates", "🗐 Marcar duplicados", "🗐 Duplikate markieren", "🗐 Segna i doppioni"][i],
         T::MarkDuplicatesHover => ["Coche pour suppression toutes les pages au contenu strictement identique (toutes les copies, sans en garder une).", "Mark for deletion every page with byte-identical content (all copies, keeping none).", "Marca para eliminar todas las páginas con contenido idéntico (todas las copias, sin conservar ninguna).", "Markiert alle Seiten mit byte-identischem Inhalt zum Löschen (alle Kopien, keine bleibt übrig).", "Seleziona per l'eliminazione tutte le pagine con contenuto identico (tutte le copie, senza tenerne nessuna)."][i],
-        T::DirRtl => ["➡⬅ sens : D→G (manga)", "➡⬅ direction: R→L (manga)", "➡⬅ sentido: D→I (manga)", "➡⬅ Richtung: R→L (Manga)", "➡⬅ senso: D→S (manga)"][i],
-        T::DirLtr => ["⬅➡ sens : G→D", "⬅➡ direction: L→R", "⬅➡ sentido: I→D", "⬅➡ Richtung: L→R", "⬅➡ senso: S→D"][i],
+        T::DirRtl => ["⬅ Lecture : droite à gauche (manga)", "⬅ Reading: right to left (manga)", "⬅ Lectura: derecha a izquierda (manga)", "⬅ Lesen: rechts nach links (Manga)", "⬅ Lettura: da destra a sinistra (manga)"][i],
+        T::DirLtr => ["➡ Lecture : gauche à droite", "➡ Reading: left to right", "➡ Lectura: izquierda a derecha", "➡ Lesen: links nach rechts", "➡ Lettura: da sinistra a destra"][i],
         T::DirHover => ["Sens de lecture, utilisé pour fusionner/découper les doubles-pages. Cliquer pour inverser.", "Reading direction, used when merging/splitting double pages. Click to flip.", "Sentido de lectura, usado al fusionar/dividir páginas dobles. Clic para invertir.", "Leserichtung, beim Zusammenführen/Teilen von Doppelseiten verwendet. Zum Umkehren klicken.", "Senso di lettura, usato per unire/dividere le pagine doppie. Clic per invertire."][i],
         T::SaveCopy => ["💾 Enregistrer une copie", "💾 Save a copy", "💾 Guardar una copia", "💾 Kopie speichern", "💾 Salva una copia"][i],
         T::Overwrite => ["⚠ Écraser l'original", "⚠ Overwrite the original", "⚠ Sobrescribir el original", "⚠ Original überschreiben", "⚠ Sovrascrivi l'originale"][i],
@@ -1868,9 +2923,9 @@ fn tr(lang: Lang, key: T) -> &'static str {
         T::Extracted => ["🖼 Image extraite : {name}", "🖼 Image extracted: {name}", "🖼 Imagen extraída: {name}", "🖼 Bild extrahiert: {name}", "🖼 Immagine estratta: {name}"][i],
         T::ExtractError => ["Extraction impossible : {e}", "Extraction failed: {e}", "No se pudo extraer: {e}", "Extraktion fehlgeschlagen: {e}", "Estrazione non riuscita: {e}"][i],
         T::NoDuplicates => ["Aucun doublon (contenu identique) détecté.", "No duplicates (identical content) found.", "No se detectaron duplicados (contenido idéntico).", "Keine Duplikate (identischer Inhalt) gefunden.", "Nessun doppione (contenuto identico) trovato."][i],
-        T::DupMarked => ["🧹 {marked} page(s) en double cochée(s) pour suppression ({groups} groupe(s)).", "🧹 {marked} duplicate page(s) marked for deletion ({groups} group(s)).", "🧹 {marked} página(s) duplicada(s) marcada(s) para eliminar ({groups} grupo(s)).", "🧹 {marked} doppelte Seite(n) zum Löschen markiert ({groups} Gruppe(n)).", "🧹 {marked} pagina/e doppia/e segnata/e per l'eliminazione ({groups} gruppo/i)."][i],
+        T::DupMarked => ["🗐 {marked} page(s) en double cochée(s) pour suppression ({groups} groupe(s)).", "🗐 {marked} duplicate page(s) marked for deletion ({groups} group(s)).", "🗐 {marked} página(s) duplicada(s) marcada(s) para eliminar ({groups} grupo(s)).", "🗐 {marked} doppelte Seite(n) zum Löschen markiert ({groups} Gruppe(n)).", "🗐 {marked} pagina/e doppia/e segnata/e per l'eliminazione ({groups} gruppo/i)."][i],
         T::NoIdenticalCopy => ["Aucune autre copie identique à cette page.", "No other copy identical to this page.", "No hay otra copia idéntica a esta página.", "Keine weitere mit dieser Seite identische Kopie.", "Nessun'altra copia identica a questa pagina."][i],
-        T::IdenticalMarked => ["🧹 {n} copies identiques cochées pour suppression.", "🧹 {n} identical copies marked for deletion.", "🧹 {n} copias idénticas marcadas para eliminar.", "🧹 {n} identische Kopien zum Löschen markiert.", "🧹 {n} copie identiche segnate per l'eliminazione."][i],
+        T::IdenticalMarked => ["🗐 {n} copies identiques cochées pour suppression.", "🗐 {n} identical copies marked for deletion.", "🗐 {n} copias idénticas marcadas para eliminar.", "🗐 {n} identische Kopien zum Löschen markiert.", "🗐 {n} copie identiche segnate per l'eliminazione."][i],
         T::CropHintEnter => ["Trace un rectangle, déplace-le ou ajuste ses poignées, puis « Valider ».", "Draw a rectangle, move it or adjust its handles, then “Apply”.", "Dibuja un rectángulo, muévelo o ajusta sus tiradores, luego «Aplicar».", "Rechteck ziehen, verschieben oder an den Griffen anpassen, dann „Übernehmen“.", "Disegna un rettangolo, spostalo o regola le maniglie, poi «Applica»."][i],
         T::DecodePageError => ["Impossible de décoder cette page : {e}", "Cannot decode this page: {e}", "No se puede decodificar esta página: {e}", "Diese Seite kann nicht dekodiert werden: {e}", "Impossibile decodificare questa pagina: {e}"][i],
         T::NoSelection => ["Aucune sélection — trace un rectangle ou clique « toute l'image ».", "No selection — draw a rectangle or click “whole image”.", "Sin selección — dibuja un rectángulo o pulsa «toda la imagen».", "Keine Auswahl — Rechteck ziehen oder „ganzes Bild“ klicken.", "Nessuna selezione — disegna un rettangolo o clicca «tutta l'immagine»."][i],
@@ -1891,34 +2946,34 @@ fn tr(lang: Lang, key: T) -> &'static str {
         T::DecodeError => ["Impossible de décoder : {e}", "Cannot decode: {e}", "No se puede decodificar: {e}", "Kann nicht dekodiert werden: {e}", "Impossibile decodificare: {e}"][i],
         T::SplitEncodeError => ["Découpe impossible (encodage des deux moitiés).", "Split failed (encoding both halves).", "No se pudo dividir (codificación de ambas mitades).", "Teilen fehlgeschlagen (Kodierung beider Hälften).", "Divisione non riuscita (codifica di entrambe le metà)."][i],
         T::SplitDone => ["Page découpée en deux (ordre de lecture respecté).", "Page split in two (reading order kept).", "Página dividida en dos (se respeta el orden de lectura).", "Seite in zwei geteilt (Lesereihenfolge beibehalten).", "Pagina divisa in due (ordine di lettura rispettato)."][i],
-        T::SplitTitle => ["🪓 Découpe en deux — {pname}", "🪓 Split in two — {pname}", "🪓 Dividir en dos — {pname}", "🪓 In zwei teilen — {pname}", "🪓 Dividi in due — {pname}"][i],
-        T::SplitHint2 => ["Glisse pour déplacer la ligne de coupe. La 1ʳᵉ page lue est surlignée en vert.", "Drag to move the cut line. The first page read is highlighted in green.", "Arrastra para mover la línea de corte. La 1.ª página leída se resalta en verde.", "Ziehen, um die Schnittlinie zu verschieben. Die zuerst gelesene Seite ist grün hervorgehoben.", "Trascina per spostare la linea di taglio. La 1ª pagina letta è evidenziata in verde."][i],
+        T::SplitTitle => ["📖 Découpe en deux — {pname}", "📖 Split in two — {pname}", "📖 Dividir en dos — {pname}", "📖 In zwei teilen — {pname}", "📖 Dividi in due — {pname}"][i],
+        T::SplitHint2 => ["Glisse ou clique pour placer la ligne de coupe (⬅/➡ pour l'ajuster, Maj = pas plus grand). La 1re page lue est surlignée en vert.", "Drag or click to place the cut line (⬅/➡ to fine-tune, Shift = bigger steps). The first page read is highlighted in green.", "Arrastra o haz clic para colocar la línea de corte (⬅/➡ para ajustar, Mayús = pasos mayores). La 1.ª página leída se resalta en verde.", "Ziehen oder klicken, um die Schnittlinie zu setzen (⬅/➡ zum Feinjustieren, Umschalt = größere Schritte). Die zuerst gelesene Seite ist grün hervorgehoben.", "Trascina o clicca per posizionare la linea di taglio (⬅/➡ per regolare, Maiusc = passi più grandi). La 1ª pagina letta è evidenziata in verde."][i],
         T::SplitApply => ["✅ Valider la découpe", "✅ Apply split", "✅ Aplicar división", "✅ Teilung übernehmen", "✅ Applica divisione"][i],
-        T::DirRtlSplit => ["droite → gauche (1ʳᵉ = droite)", "right → left (1st = right)", "derecha → izquierda (1.ª = derecha)", "rechts → links (1. = rechts)", "destra → sinistra (1ª = destra)"][i],
-        T::DirLtrSplit => ["gauche → droite (1ʳᵉ = gauche)", "left → right (1st = left)", "izquierda → derecha (1.ª = izquierda)", "links → rechts (1. = links)", "sinistra → destra (1ª = sinistra)"][i],
-        T::SplitDirBtn => ["⇄ Sens : {dir}", "⇄ Direction: {dir}", "⇄ Sentido: {dir}", "⇄ Richtung: {dir}", "⇄ Senso: {dir}"][i],
+        T::DirRtlSplit => ["droite à gauche (1re = droite)", "right to left (1st = right)", "derecha a izquierda (1.ª = derecha)", "rechts nach links (1. = rechts)", "da destra a sinistra (1ª = destra)"][i],
+        T::DirLtrSplit => ["gauche à droite (1re = gauche)", "left to right (1st = left)", "izquierda a derecha (1.ª = izquierda)", "links nach rechts (1. = links)", "da sinistra a destra (1ª = sinistra)"][i],
+        T::SplitDirBtn => ["↔ Sens : {dir}", "↔ Direction: {dir}", "↔ Sentido: {dir}", "↔ Richtung: {dir}", "↔ Senso: {dir}"][i],
         T::FlipDirHover => ["Inverser le sens de lecture", "Flip the reading direction", "Invertir el sentido de lectura", "Leserichtung umkehren", "Inverti il senso di lettura"][i],
         T::CutAt => ["Coupe à x = {cut} / {width}", "Cut at x = {cut} / {width}", "Corte en x = {cut} / {width}", "Schnitt bei x = {cut} / {width}", "Taglio a x = {cut} / {width}"][i],
-        T::FirstPage => ["1ʳᵉ", "1st", "1.ª", "1.", "1ª"][i],
-        T::SecondPage => ["2ᵉ", "2nd", "2.ª", "2.", "2ª"][i],
+        T::FirstPage => ["1re", "1st", "1.ª", "1.", "1ª"][i],
+        T::SecondPage => ["2e", "2nd", "2.ª", "2.", "2ª"][i],
         T::NoFileOpen => ["Aucun fichier ouvert.", "No file open.", "Ningún archivo abierto.", "Keine Datei geöffnet.", "Nessun file aperto."][i],
         T::BuildError => ["Erreur de construction : {e}", "Build error: {e}", "Error de construcción: {e}", "Erstellungsfehler: {e}", "Errore di costruzione: {e}"][i],
         T::BakError => ["Sauvegarde .bak impossible : {e}", ".bak backup failed: {e}", "No se pudo crear la copia .bak: {e}", ".bak-Backup fehlgeschlagen: {e}", "Backup .bak non riuscito: {e}"][i],
         T::WriteError => ["Écriture impossible : {e}", "Write failed: {e}", "No se pudo escribir: {e}", "Schreiben fehlgeschlagen: {e}", "Scrittura non riuscita: {e}"][i],
         T::ReplaceError => ["Remplacement impossible : {e}", "Replace failed: {e}", "No se pudo reemplazar: {e}", "Ersetzen fehlgeschlagen: {e}", "Sostituzione non riuscita: {e}"][i],
-        T::Overwritten => ["✅ Original écrasé ({kept} pages gardées). Sauvegarde .bak créée.", "✅ Original overwritten ({kept} pages kept). .bak backup created.", "✅ Original sobrescrito ({kept} páginas conservadas). Copia .bak creada.", "✅ Original überschrieben ({kept} Seiten behalten). .bak-Backup erstellt.", "✅ Originale sovrascritto ({kept} pagine mantenute). Backup .bak creato."][i],
+        T::Overwritten => ["✅ Original écrasé ({kept} pages). Sauvegarde .bak créée.", "✅ Original overwritten ({kept} pages). .bak backup created.", "✅ Original sobrescrito ({kept} páginas). Copia .bak creada.", "✅ Original überschrieben ({kept} Seiten). .bak-Backup erstellt.", "✅ Originale sovrascritto ({kept} pagine). Backup .bak creato."][i],
         T::CopySaved => ["✅ Copie enregistrée : {name}", "✅ Copy saved: {name}", "✅ Copia guardada: {name}", "✅ Kopie gespeichert: {name}", "✅ Copia salvata: {name}"][i],
         T::EditedSuffix => ["édité", "edited", "editado", "bearbeitet", "modificato"][i],
-        T::ThumbHover => ["Clic = agrandir · glisser = déplacer · clic droit = options", "Click = enlarge · drag = move · right-click = options", "Clic = ampliar · arrastrar = mover · clic derecho = opciones", "Klick = vergrößern · Ziehen = verschieben · Rechtsklick = Optionen", "Clic = ingrandisci · trascina = sposta · clic destro = opzioni"][i],
+        T::ThumbHover => ["Clic = agrandir · glisser = déplacer · clic droit = plus d'options", "Click = enlarge · drag = move · right-click = more options", "Clic = ampliar · arrastrar = mover · clic derecho = más opciones", "Klick = vergrößern · Ziehen = verschieben · Rechtsklick = weitere Optionen", "Clic = ingrandisci · trascina = sposta · clic destro = altre opzioni"][i],
         T::MenuEnlarge => ["🔍 Voir en grand", "🔍 View large", "🔍 Ver en grande", "🔍 Groß ansehen", "🔍 Vedi in grande"][i],
-        T::MenuSplit => ["🪓 Découper en deux pages…", "🪓 Split into two pages…", "🪓 Dividir en dos páginas…", "🪓 In zwei Seiten teilen…", "🪓 Dividi in due pagine…"][i],
+        T::MenuSplit => ["📖 Découper en deux pages…", "📖 Split into two pages…", "📖 Dividir en dos páginas…", "📖 In zwei Seiten teilen…", "📖 Dividi in due pagine…"][i],
         T::MenuMerge => ["🔗 Fusionner avec la suivante", "🔗 Merge with next", "🔗 Fusionar con la siguiente", "🔗 Mit nächster zusammenführen", "🔗 Unisci con la successiva"][i],
         T::MenuInsertBefore => ["➕ Insérer une image AVANT", "➕ Insert an image BEFORE", "➕ Insertar una imagen ANTES", "➕ Bild DAVOR einfügen", "➕ Inserisci un'immagine PRIMA"][i],
         T::MenuInsertAfter => ["➕ Insérer une image APRÈS", "➕ Insert an image AFTER", "➕ Insertar una imagen DESPUÉS", "➕ Bild DANACH einfügen", "➕ Inserisci un'immagine DOPO"][i],
-        T::MenuMoveStart => ["⤒ Déplacer au début", "⤒ Move to start", "⤒ Mover al principio", "⤒ An den Anfang verschieben", "⤒ Sposta all'inizio"][i],
-        T::MenuMoveEnd => ["⤓ Déplacer à la fin", "⤓ Move to end", "⤓ Mover al final", "⤓ Ans Ende verschieben", "⤓ Sposta alla fine"][i],
+        T::MenuMoveStart => ["⏮ Déplacer au début", "⏮ Move to start", "⏮ Mover al principio", "⏮ An den Anfang verschieben", "⏮ Sposta all'inizio"][i],
+        T::MenuMoveEnd => ["⏭ Déplacer à la fin", "⏭ Move to end", "⏭ Mover al final", "⏭ Ans Ende verschieben", "⏭ Sposta alla fine"][i],
         T::MenuExtract => ["💾 Extraire l'image (fichier)…", "💾 Extract image (file)…", "💾 Extraer la imagen (archivo)…", "💾 Bild extrahieren (Datei)…", "💾 Estrai l'immagine (file)…"][i],
-        T::MenuMarkIdentical => ["🧹 Cocher les copies identiques", "🧹 Check identical copies", "🧹 Marcar las copias idénticas", "🧹 Identische Kopien markieren", "🧹 Seleziona le copie identiche"][i],
+        T::MenuMarkIdentical => ["🗐 Cocher les copies identiques", "🗐 Mark identical copies", "🗐 Marcar las copias idénticas", "🗐 Identische Kopien markieren", "🗐 Segna le copie identiche"][i],
         T::MenuMarkIdenticalHover => ["Coche pour suppression toutes les pages au contenu identique à celle-ci (cette page comprise).", "Mark for deletion all pages with content identical to this one (this page included).", "Marca para eliminar todas las páginas con contenido idéntico a esta (incluida esta).", "Markiert alle Seiten mit zu dieser identischem Inhalt zum Löschen (diese Seite eingeschlossen).", "Seleziona per l'eliminazione tutte le pagine identiche a questa (questa inclusa)."][i],
         T::Illegible => ["⚠\nillisible", "⚠\nunreadable", "⚠\nilegible", "⚠\nunlesbar", "⚠\nilleggibile"][i],
         T::KeepHover => ["Garder", "Keep", "Conservar", "Behalten", "Mantieni"][i],
@@ -1927,14 +2982,14 @@ fn tr(lang: Lang, key: T) -> &'static str {
         T::MoveBeforeHover => ["Déplacer avant", "Move before", "Mover antes", "Nach vorne verschieben", "Sposta prima"][i],
         T::MoveAfterHover => ["Déplacer après", "Move after", "Mover después", "Nach hinten verschieben", "Sposta dopo"][i],
         T::ImageInserted => ["Image insérée. (À l'enregistrement, les pages seront renumérotées dans le nouvel ordre.)", "Image inserted. (On save, pages will be renumbered in the new order.)", "Imagen insertada. (Al guardar, las páginas se renumerarán en el nuevo orden.)", "Bild eingefügt. (Beim Speichern werden die Seiten in der neuen Reihenfolge neu nummeriert.)", "Immagine inserita. (Al salvataggio, le pagine saranno rinumerate nel nuovo ordine.)"][i],
-        T::PageMoved => ["Page déplacée.", "Page moved.", "Página movida.", "Seite verschoben.", "Pagina spostata."][i],
+        T::PageMoved => ["Page déplacée en position {n}.", "Page moved to position {n}.", "Página movida a la posición {n}.", "Seite an Position {n} verschoben.", "Pagina spostata in posizione {n}."][i],
         T::ViewerClose => ["✖ Fermer (Échap)", "✖ Close (Esc)", "✖ Cerrar (Esc)", "✖ Schließen (Esc)", "✖ Chiudi (Esc)"][i],
         T::ViewerPrev => ["◀ Précédente", "◀ Previous", "◀ Anterior", "◀ Zurück", "◀ Precedente"][i],
         T::ViewerNext => ["Suivante ▶", "Next ▶", "Siguiente ▶", "Weiter ▶", "Successiva ▶"][i],
-        T::ViewerKeep => ["↩ garder", "↩ keep", "↩ conservar", "↩ behalten", "↩ mantieni"][i],
-        T::ViewerDelete => ["🗑 supprimer", "🗑 delete", "🗑 eliminar", "🗑 löschen", "🗑 elimina"][i],
-        T::ViewerCrop => ["✂ couverture", "✂ cover", "✂ portada", "✂ Cover", "✂ copertina"][i],
-        T::ViewerExtract => ["💾 extraire", "💾 extract", "💾 extraer", "💾 extrahieren", "💾 estrai"][i],
+        T::ViewerKeep => ["↩ Garder", "↩ Keep", "↩ Conservar", "↩ Behalten", "↩ Mantieni"][i],
+        T::ViewerDelete => ["🗑 Supprimer", "🗑 Delete", "🗑 Eliminar", "🗑 Löschen", "🗑 Elimina"][i],
+        T::ViewerCrop => ["✂ Couverture", "✂ Cover", "✂ Portada", "✂ Cover", "✂ Copertina"][i],
+        T::ViewerExtract => ["💾 Extraire", "💾 Extract", "💾 Extraer", "💾 Extrahieren", "💾 Estrai"][i],
         T::IllegibleViewer => ["⚠ Image illisible (format non pris en charge ou fichier corrompu).", "⚠ Unreadable image (unsupported format or corrupt file).", "⚠ Imagen ilegible (formato no compatible o archivo dañado).", "⚠ Unlesbares Bild (nicht unterstütztes Format oder beschädigte Datei).", "⚠ Immagine illeggibile (formato non supportato o file danneggiato)."][i],
         T::DropToPage1 => ["Lâcher : l'image sera ajoutée en page 1", "Drop: the image will be added as page 1", "Suelta: la imagen se añadirá como página 1", "Loslassen: das Bild wird als Seite 1 hinzugefügt", "Rilascia: l'immagine sarà aggiunta come pagina 1"][i],
         T::DropCbzHere => ["Déposez un .cbz ici", "Drop a .cbz here", "Suelta un .cbz aquí", "Eine .cbz hier ablegen", "Rilascia un .cbz qui"][i],
@@ -1943,9 +2998,37 @@ fn tr(lang: Lang, key: T) -> &'static str {
         T::ToastImagesAdded => ["🖼 {count} images ajoutées en tête (pages 1–{count}) — renumérotation à l'enregistrement.", "🖼 {count} images added at the start (pages 1–{count}) — renumbering on save.", "🖼 {count} imágenes añadidas al principio (páginas 1–{count}) — renumeración al guardar.", "🖼 {count} Bilder am Anfang hinzugefügt (Seiten 1–{count}) — Neunummerierung beim Speichern.", "🖼 {count} immagini aggiunte all'inizio (pagine 1–{count}) — rinumerazione al salvataggio."][i],
         T::ConfirmTitle => ["Confirmer l'écrasement", "Confirm overwrite", "Confirmar sobrescritura", "Überschreiben bestätigen", "Conferma sovrascrittura"][i],
         T::ConfirmLine1 => ["Le .cbz original va être remplacé.", "The original .cbz will be replaced.", "El .cbz original será reemplazado.", "Die originale .cbz wird ersetzt.", "Il .cbz originale sarà sostituito."][i],
-        T::ConfirmLine2 => ["Une sauvegarde « .cbz.bak » est créée automatiquement.", "A “.cbz.bak” backup is created automatically.", "Se crea automáticamente una copia «.cbz.bak».", "Ein „.cbz.bak“-Backup wird automatisch erstellt.", "Un backup «.cbz.bak» viene creato automaticamente."][i],
+        T::ConfirmLine2 => ["Une sauvegarde « .cbz.bak » de l'original est créée automatiquement (une seule fois).", "A “.cbz.bak” backup of the original is created automatically (once).", "Se crea automáticamente una copia «.cbz.bak» del original (una sola vez).", "Ein „.cbz.bak“-Backup des Originals wird automatisch erstellt (einmalig).", "Un backup «.cbz.bak» dell'originale viene creato automaticamente (una sola volta)."][i],
         T::ConfirmYes => ["Oui, écraser", "Yes, overwrite", "Sí, sobrescribir", "Ja, überschreiben", "Sì, sovrascrivi"][i],
         T::CancelPlain => ["Annuler", "Cancel", "Cancelar", "Abbrechen", "Annulla"][i],
+        T::ReadError => ["Lecture impossible : {e}", "Cannot read: {e}", "No se puede leer: {e}", "Lesen fehlgeschlagen: {e}", "Lettura non riuscita: {e}"][i],
+        T::Undone => ["⟲ Action défaite.", "⟲ Action undone.", "⟲ Acción deshecha.", "⟲ Aktion rückgängig gemacht.", "⟲ Azione annullata."][i],
+        T::Redone => ["⟳ Action refaite.", "⟳ Action redone.", "⟳ Acción rehecha.", "⟳ Aktion wiederhergestellt.", "⟳ Azione ripristinata."][i],
+        T::Undo => ["⟲ Défaire", "⟲ Undo", "⟲ Deshacer", "⟲ Rückgängig", "⟲ Annulla"][i],
+        T::Redo => ["⟳ Refaire", "⟳ Redo", "⟳ Rehacer", "⟳ Wiederholen", "⟳ Ripeti"][i],
+        T::UndoHover => ["Défaire la dernière action (Ctrl+Z)", "Undo the last action (Ctrl+Z)", "Deshacer la última acción (Ctrl+Z)", "Letzte Aktion rückgängig machen (Strg+Z)", "Annulla l'ultima azione (Ctrl+Z)"][i],
+        T::RedoHover => ["Refaire l'action défaite (Ctrl+Y)", "Redo the undone action (Ctrl+Y)", "Rehacer la acción deshecha (Ctrl+Y)", "Rückgängig gemachte Aktion wiederholen (Strg+Y)", "Ripeti l'azione annullata (Ctrl+Y)"][i],
+        T::CoverRemoved => ["Couverture recadrée retirée.", "Cropped cover removed.", "Portada recortada eliminada.", "Zugeschnittenes Cover entfernt.", "Copertina ritagliata rimossa."][i],
+        T::RemoveCoverHover => ["Retirer la couverture recadrée", "Remove the cropped cover", "Quitar la portada recortada", "Zugeschnittenes Cover entfernen", "Rimuovi la copertina ritagliata"][i],
+        T::NoPagesToSave => ["rien à enregistrer : toutes les pages sont marquées pour suppression.", "nothing to save: every page is marked for deletion.", "nada que guardar: todas las páginas están marcadas para eliminar.", "nichts zu speichern: alle Seiten sind zum Löschen markiert.", "niente da salvare: tutte le pagine sono segnate per l'eliminazione."][i],
+        T::OverwrittenBakKept => ["✅ Original écrasé ({kept} pages). La sauvegarde .bak d'origine est conservée.", "✅ Original overwritten ({kept} pages). The original .bak backup is kept.", "✅ Original sobrescrito ({kept} páginas). Se conserva la copia .bak original.", "✅ Original überschrieben ({kept} Seiten). Das ursprüngliche .bak-Backup bleibt erhalten.", "✅ Originale sovrascritto ({kept} pagine). Il backup .bak originale è conservato."][i],
+        T::Unsaved => ["• non enregistré", "• unsaved", "• sin guardar", "• nicht gespeichert", "• non salvato"][i],
+        T::SaveCopyHover => ["Enregistre « nom (édité).cbz » à côté de l'original, sans le toucher (Ctrl+S)", "Save “name (edited).cbz” next to the original, leaving it untouched (Ctrl+S)", "Guarda «nombre (editado).cbz» junto al original, sin modificarlo (Ctrl+S)", "Speichert „Name (bearbeitet).cbz“ neben dem Original, ohne es zu ändern (Strg+S)", "Salva «nome (modificato).cbz» accanto all'originale, senza toccarlo (Ctrl+S)"][i],
+        T::KeyEnter => ["Entrée", "Enter", "Intro", "Eingabe", "Invio"][i],
+        T::KeyEsc => ["Échap", "Esc", "Esc", "Esc", "Esc"][i],
+        T::KeyDel => ["Suppr", "Delete", "Supr", "Entf", "Canc"][i],
+        T::NoImages => ["Aucune image dans cette archive.", "No images in this archive.", "No hay imágenes en este archivo.", "Keine Bilder in diesem Archiv.", "Nessuna immagine in questo archivio."][i],
+        T::MenuKeep => ["↩ Garder cette page", "↩ Keep this page", "↩ Conservar esta página", "↩ Diese Seite behalten", "↩ Mantieni questa pagina"][i],
+        T::MenuDelete => ["🗑 Marquer pour suppression", "🗑 Mark for deletion", "🗑 Marcar para eliminar", "🗑 Zum Löschen markieren", "🗑 Segna per l'eliminazione"][i],
+        T::MenuCrop => ["✂ Recadrer en couverture…", "✂ Crop to cover…", "✂ Recortar como portada…", "✂ Als Cover zuschneiden…", "✂ Ritaglia come copertina…"][i],
+        T::MarkedForDeletion => ["Page marquée pour suppression", "Page marked for deletion", "Página marcada para eliminar", "Seite zum Löschen markiert", "Pagina segnata per l'eliminazione"][i],
+        T::ZoomHover => ["Clic : taille réelle ↔ ajuster à la fenêtre", "Click: actual size ↔ fit to window", "Clic: tamaño real ↔ ajustar a la ventana", "Klick: Originalgröße ↔ an Fenster anpassen", "Clic: dimensione reale ↔ adatta alla finestra"][i],
+        T::DropOnlyInGrid => ["Pour insérer une image, revenir d'abord à la grille des pages.", "To insert an image, first go back to the page grid.", "Para insertar una imagen, vuelve primero a la cuadrícula de páginas.", "Um ein Bild einzufügen, zuerst zur Seitenübersicht zurückkehren.", "Per inserire un'immagine, torna prima alla griglia delle pagine."][i],
+        T::DropNothingUsable => ["Aucune image utilisable dans le dépôt (formats : jpg, png, webp, gif, bmp).", "No usable image in the drop (formats: jpg, png, webp, gif, bmp).", "Ninguna imagen utilizable (formatos: jpg, png, webp, gif, bmp).", "Kein verwendbares Bild abgelegt (Formate: jpg, png, webp, gif, bmp).", "Nessuna immagine utilizzabile (formati: jpg, png, webp, gif, bmp)."][i],
+        T::DiscardTitle => ["Modifications non enregistrées", "Unsaved changes", "Cambios sin guardar", "Nicht gespeicherte Änderungen", "Modifiche non salvate"][i],
+        T::DiscardLine => ["Les modifications en cours seront perdues.", "Your current changes will be lost.", "Se perderán los cambios actuales.", "Die aktuellen Änderungen gehen verloren.", "Le modifiche in corso andranno perse."][i],
+        T::DiscardYes => ["Abandonner les modifications", "Discard changes", "Descartar los cambios", "Änderungen verwerfen", "Scarta le modifiche"][i],
+        T::SaveCopyFirst => ["💾 Enregistrer une copie d'abord", "💾 Save a copy first", "💾 Guardar una copia primero", "💾 Zuerst eine Kopie speichern", "💾 Salva prima una copia"][i],
     }
 }
 
@@ -2025,7 +3108,14 @@ fn content_hash(bytes: &[u8]) -> u64 {
 fn short_name(name: &str) -> String {
     let base = name.rsplit('/').next().unwrap_or(name);
     if base.chars().count() > 20 {
-        let tail: String = base.chars().rev().take(19).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = base
+            .chars()
+            .rev()
+            .take(19)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         format!("…{tail}")
     } else {
         base.to_string()
@@ -2034,7 +3124,20 @@ fn short_name(name: &str) -> String {
 
 fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     let mut out = Cursor::new(Vec::new());
-    let rgb = img.to_rgb8();
+    // JPEG n'a pas de transparence : aplatir sur fond blanc (sinon les zones
+    // transparentes d'un PNG deviendraient noires).
+    let rgb = if img.color().has_alpha() {
+        let mut rgba = img.to_rgba8();
+        for px in rgba.pixels_mut() {
+            let a = px[3] as u32;
+            for c in 0..3 {
+                px[c] = ((px[c] as u32 * a + 255 * (255 - a)) / 255) as u8;
+            }
+        }
+        image::DynamicImage::ImageRgba8(rgba).to_rgb8()
+    } else {
+        img.to_rgb8()
+    };
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
         .encode_image(&rgb)
         .map_err(|e| e.to_string())?;
@@ -2076,6 +3179,72 @@ fn update_pagecount(xml: &[u8], n: usize) -> Vec<u8> {
         }
     }
     xml.to_vec()
+}
+
+// Retire le bloc <Pages>…</Pages> (ou <Pages/>) d'un ComicInfo, au niveau octets.
+// Un XML non‑UTF‑8 (UTF‑16…) ne contient pas ces motifs ASCII : laissé intact.
+fn strip_pages_block(xml: &[u8]) -> Vec<u8> {
+    let Some(a) = find_bytes(xml, b"<Pages") else {
+        return xml.to_vec();
+    };
+    // « <Pages » doit être suivi de « > », « / » ou d'un blanc (pas « <PagesFoo »).
+    let after = xml.get(a + 6).copied().unwrap_or(b'>');
+    if !(after == b'>' || after == b'/' || after.is_ascii_whitespace()) {
+        return xml.to_vec();
+    }
+    let Some(gt) = find_bytes(&xml[a..], b">").map(|k| a + k) else {
+        return xml.to_vec();
+    };
+    let end = if xml[gt - 1] == b'/' {
+        gt + 1
+    } else {
+        match find_bytes(&xml[a..], b"</Pages>") {
+            Some(k) => a + k + b"</Pages>".len(),
+            None => return xml.to_vec(),
+        }
+    };
+    // Supprimer aussi l'indentation qui précède et le saut de ligne qui suit.
+    let mut start = a;
+    while start > 0 && (xml[start - 1] == b' ' || xml[start - 1] == b'\t') {
+        start -= 1;
+    }
+    let mut stop = end;
+    if xml.get(stop) == Some(&b'\r') {
+        stop += 1;
+    }
+    if xml.get(stop) == Some(&b'\n') {
+        stop += 1;
+    }
+    let mut out = Vec::with_capacity(xml.len());
+    out.extend_from_slice(&xml[..start]);
+    out.extend_from_slice(&xml[stop..]);
+    out
+}
+
+// Écrit puis force l'écriture sur disque (fsync) avant de rendre la main : un
+// « rename » atomique ne protège rien si le contenu n'est pas encore sur le disque.
+fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+// Nom de fichier de couverture (« 000_cover.jpg »…), dossier éventuel ignoré.
+fn is_cover_name(name: &str) -> bool {
+    name.rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .to_lowercase()
+        .contains("000_cover")
+}
+
+// Extension (en minuscules) d'un nom de page, « jpg » par défaut.
+fn ext_of(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_else(|| "jpg".into())
 }
 
 fn config_path(name: &str) -> Option<PathBuf> {
@@ -2140,5 +3309,225 @@ fn load_icon() -> egui::IconData {
             width: 1,
             height: 1,
         },
+    }
+}
+
+// Tests de la logique hors interface (construction du CBZ, ComicInfo, tri, Défaire).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(w: u32, h: u32, rgba: [u8; 4]) -> Arc<[u8]> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner().into()
+    }
+
+    fn app(names: &[&str], ci: Option<&str>) -> CbzApp {
+        let mut a = CbzApp {
+            path: Some(PathBuf::from("/tmp/x.cbz")),
+            ..Default::default()
+        };
+        for (i, n) in names.iter().enumerate() {
+            a.pages.push(Page::new(
+                n.to_string(),
+                png(2, 2, [i as u8, 0, 0, 255]),
+                i as u64,
+            ));
+        }
+        a.next_uid = names.len() as u64;
+        a.comicinfo = ci.map(|s| s.as_bytes().to_vec());
+        a.saved_sig = a.edit_sig();
+        a
+    }
+
+    fn names(b: &Built) -> Vec<String> {
+        b.entries.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    fn zip_names(data: &[u8]) -> Vec<String> {
+        let z = zip::ZipArchive::new(Cursor::new(data)).unwrap();
+        z.file_names().map(String::from).collect()
+    }
+
+    #[test]
+    fn tri_naturel() {
+        let mut v = vec!["p10.jpg", "p2.jpg", "P1.jpg", "p02.jpg"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, ["P1.jpg", "p2.jpg", "p02.jpg", "p10.jpg"]);
+    }
+
+    #[test]
+    fn noms_conserves_sans_modification() {
+        let a = app(&["d/001.jpg", "d/002.jpg"], None);
+        let b = a.build_cbz().unwrap();
+        assert_eq!(names(&b), ["d/001.jpg", "d/002.jpg"]);
+        assert_eq!(zip_names(&b.data), ["d/001.jpg", "d/002.jpg"]);
+    }
+
+    #[test]
+    fn suppression_pagecount_et_bloc_pages() {
+        let ci = "<ComicInfo>\n  <PageCount>3</PageCount>\n  <Pages>\n    <Page Image=\"0\"/>\n  </Pages>\n</ComicInfo>";
+        let mut a = app(&["1.jpg", "2.jpg", "3.jpg"], Some(ci));
+        a.pages[1].delete = true;
+        let b = a.build_cbz().unwrap();
+        assert_eq!(names(&b), ["1.jpg", "3.jpg"]);
+        let xml = String::from_utf8(b.comicinfo.unwrap()).unwrap();
+        assert_eq!(xml, "<ComicInfo>\n  <PageCount>2</PageCount>\n</ComicInfo>");
+    }
+
+    #[test]
+    fn bloc_pages_garde_si_rien_ne_change() {
+        let ci = "<ComicInfo><PageCount>1</PageCount><Pages/></ComicInfo>";
+        let a = app(&["1.jpg"], Some(ci));
+        let xml = String::from_utf8(a.build_cbz().unwrap().comicinfo.unwrap()).unwrap();
+        assert!(xml.contains("<Pages/>"));
+        assert_eq!(
+            strip_pages_block(xml.as_bytes()),
+            b"<ComicInfo><PageCount>1</PageCount></ComicInfo>"
+        );
+        // « <PagesX> » n'est pas un bloc Pages.
+        assert_eq!(
+            strip_pages_block(b"<PagesX>a</PagesX>"),
+            b"<PagesX>a</PagesX>"
+        );
+    }
+
+    #[test]
+    fn reordre_renumerote() {
+        let mut a = app(&["a.jpg", "b.png"], None);
+        a.pages.swap(0, 1);
+        a.dirty_order = true;
+        assert_eq!(names(&a.build_cbz().unwrap()), ["p0000.png", "p0001.jpg"]);
+    }
+
+    #[test]
+    fn couverture_existante_garde_son_extension_et_reste_unique() {
+        let a = app(&["000_cover.png", "001.jpg", "x/000_cover.jpg"], None);
+        let b = a.build_cbz().unwrap();
+        // Une seule page sert de couverture ; l'autre « 000_cover » reste une page.
+        assert_eq!(b.entries.len(), 3);
+        assert_eq!(b.entries[0], ("000_cover.png".to_string(), Some(0)));
+    }
+
+    #[test]
+    fn couverture_pas_en_tete_force_la_renumerotation() {
+        // « 000.jpg » serait trié AVANT « 000_cover.jpg » : il faut renuméroter.
+        let mut a = app(&["000.jpg", "001.jpg"], None);
+        let tex_ctx = egui::Context::default();
+        let tex = tex_ctx.load_texture(
+            "t",
+            ColorImage::new([1, 1], Color32::WHITE),
+            TextureOptions::LINEAR,
+        );
+        a.cover = Some(Cover {
+            bytes: png(1, 1, [0, 0, 0, 255]),
+            tex,
+            id: 99,
+        });
+        assert_eq!(
+            names(&a.build_cbz().unwrap()),
+            ["000_cover.jpg", "p0000.jpg", "p0001.jpg"]
+        );
+    }
+
+    #[test]
+    fn tout_supprime_refuse() {
+        let mut a = app(&["1.jpg"], None);
+        a.pages[0].delete = true;
+        assert!(a.build_cbz().is_err());
+    }
+
+    #[test]
+    fn defaire_refaire_et_modifie() {
+        let mut a = app(&["1.jpg", "2.jpg"], None);
+        assert!(!a.is_modified());
+        a.toggle_delete(0);
+        assert!(a.is_modified());
+        a.undo();
+        assert!(!a.is_modified() && !a.pages[0].delete);
+        a.redo();
+        assert!(a.pages[0].delete);
+        // Recocher puis décocher = retour à l'état enregistré.
+        a.toggle_delete(0);
+        assert!(!a.is_modified());
+    }
+
+    #[test]
+    fn deplacement_sur_place_ne_modifie_rien() {
+        let mut a = app(&["1.jpg", "2.jpg"], None);
+        a.move_page_to(0, 1); // lâchée juste après elle-même
+        assert!(!a.dirty_order && a.undo.is_empty());
+        a.move_page_to(0, 2);
+        assert_eq!(a.pages[1].uid, 0);
+        assert!(a.dirty_order);
+    }
+
+    #[test]
+    fn synchro_apres_ecrasement() {
+        let mut a = app(&["1.jpg", "2.jpg", "3.jpg"], None);
+        a.pages[0].delete = true;
+        a.pages.swap(1, 2);
+        a.dirty_order = true;
+        let b = a.build_cbz().unwrap();
+        a.sync_after_overwrite(b);
+        let n: Vec<_> = a.pages.iter().map(|p| (p.name.as_str(), p.uid)).collect();
+        assert_eq!(n, [("p0000.jpg", 2), ("p0001.jpg", 1)]);
+        assert!(!a.is_modified() && !a.dirty_order);
+    }
+
+    #[test]
+    fn lecture_ignore_metadonnees_macos() {
+        let dir = std::env::temp_dir().join(format!("cbz-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.cbz");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            let o = zip::write::SimpleFileOptions::default();
+            for n in [
+                "p10.jpg",
+                "p2.jpg",
+                "__MACOSX/._p2.jpg",
+                "._p3.jpg",
+                "notes.txt",
+            ] {
+                zw.start_file(n, o).unwrap();
+                zw.write_all(b"x").unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let (pages, ci) = CbzApp::read_cbz(&path, Lang::Fr).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let n: Vec<_> = pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(n, ["p2.jpg", "p10.jpg"]);
+        assert!(ci.is_none());
+    }
+
+    #[test]
+    fn jpeg_aplatit_la_transparence_sur_blanc() {
+        let img = image::load_from_memory(&png(4, 4, [0, 0, 0, 0])).unwrap();
+        let back = image::load_from_memory(&encode_jpeg(&img, 92).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert!(back.get_pixel(1, 1).0.iter().all(|&c| c > 240));
+    }
+
+    #[test]
+    fn table_de_traduction_complete() {
+        // Chaque langue : aucune chaîne vide pour quelques clés témoins.
+        for l in Lang::ALL {
+            for k in [
+                T::WindowTitle,
+                T::DiscardTitle,
+                T::SaveCopyFirst,
+                T::Undo,
+                T::KeyDel,
+            ] {
+                assert!(!tr(l, k).is_empty());
+            }
+        }
     }
 }

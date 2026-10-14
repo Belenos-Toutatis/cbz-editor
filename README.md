@@ -14,11 +14,12 @@
 - 🪓 **Découper** une double-page en deux (ligne de coupe **déplaçable**, sens **RTL/LTR**) · 🔗 **fusionner** deux pages en double-page.
 - 🧹 **Marquer les doublons** : coche pour suppression les pages au **contenu identique** (octets) en un clic.
 - ✂️ **Recadrer** une page en **couverture** (`000_cover.jpg`), cadre déplaçable/redimensionnable.
-- 🔍 **Agrandir** une page (flèches pour feuilleter, Échap pour revenir) · 💾 **extraire** une page vers un fichier.
+- 🔍 **Agrandir** une page (flèches pour feuilleter, **clic = taille réelle**, Échap pour revenir) · 💾 **extraire** une page vers un fichier.
 - 🌍 **Interface en 5 langues** — français, anglais, espagnol, allemand, italien (détectée selon la locale, modifiable dans la barre du haut).
 - Formats lus : **JPG, PNG, WebP, GIF, BMP** ; pages classées en **ordre naturel** (`page2` avant `page10`).
-- Conserve le `ComicInfo.xml` et **recalcule le `PageCount`** ; écriture en ZIP *stored*.
+- Conserve le `ComicInfo.xml` et **recalcule le `PageCount`** (le bloc `<Pages>` est retiré s'il ne correspond plus) ; écriture en ZIP *stored*. Couverture toujours triée **en tête**.
 - Enregistrement **sûr** : copie « … (édité).cbz » (jamais écrasée) ou écrasement de l'original avec sauvegarde `.bak` automatique.
+- ↩️ **Défaire / Refaire** toutes les modifications · avertissement avant de **fermer** ou d'**ouvrir** un autre fichier s'il reste des **modifications non enregistrées**.
 
 ## Installation
 
@@ -42,6 +43,14 @@ cbz-editor "Tome.cbz"      # ouvre directement un fichier
 **Clic droit** sur une page pour tout le menu (découper, fusionner, insérer, extraire, déplacer).
 **Glisser** une vignette pour la déplacer ; **glisser** une image depuis l'explorateur pour l'insérer.
 La **langue** suit votre système ; un sélecteur en haut à droite permet d'en changer (choix mémorisé).
+
+### Raccourcis clavier
+| Où | Touches |
+|---|---|
+| Partout | **Ctrl+O** ouvrir · **Ctrl+S** enregistrer une copie · **Ctrl+Z** défaire · **Ctrl+Y** / **Ctrl+Maj+Z** refaire |
+| Agrandissement | **← / →** page précédente/suivante · **Début / Fin** · **Suppr** marquer/garder · **Échap** fermer |
+| Découpe | **← / →** ajuster la coupe (**Maj** = pas plus grand) · **Entrée** valider · **Échap** annuler |
+| Recadrage | **Entrée** valider · **Échap** annuler |
 
 ## Compiler / empaqueter
 ```bash

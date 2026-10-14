@@ -14,11 +14,12 @@ A graphical editor for **CBZ** files (comics / manga), written in Rust with
 - 🪓 **Split** a double page in two (**movable** cut line, **RTL/LTR** direction) · 🔗 **merge** two pages into a double page.
 - 🧹 **Mark duplicates**: mark for deletion the pages with **identical content** (bytes) in one click.
 - ✂️ **Crop** a page into a **cover** (`000_cover.jpg`), movable/resizable frame.
-- 🔍 **Enlarge** a page (arrow keys to flip through, Esc to go back) · 💾 **extract** a page to a file.
+- 🔍 **Enlarge** a page (arrow keys to flip through, **click = actual size**, Esc to go back) · 💾 **extract** a page to a file.
 - 🌍 **UI in 5 languages** — French, English, Spanish, German, Italian (detected from the locale, switchable from the top bar).
 - Formats read: **JPG, PNG, WebP, GIF, BMP**; pages sorted in **natural order** (`page2` before `page10`).
-- Keeps `ComicInfo.xml` and **recomputes `PageCount`**; written as a *stored* ZIP.
+- Keeps `ComicInfo.xml` and **recomputes `PageCount`** (the `<Pages>` block is removed when it no longer matches); written as a *stored* ZIP. The cover always sorts **first**.
 - **Safe** saving: a “… (edited).cbz” copy (never overwritten) or overwrite the original with an automatic `.bak` backup.
+- ↩️ **Undo / Redo** every change · warning before **closing** or **opening** another file when there are **unsaved changes**.
 
 ## Installation
 
@@ -42,6 +43,14 @@ cbz-editor "Volume.cbz"    # open a file directly
 **Right-click** a page for the full menu (split, merge, insert, extract, move).
 **Drag** a thumbnail to move it; **drag** an image from your file manager to insert it.
 The **language** follows your system; a selector in the top-right lets you change it (remembered).
+
+### Keyboard shortcuts
+| Where | Keys |
+|---|---|
+| Everywhere | **Ctrl+O** open · **Ctrl+S** save a copy · **Ctrl+Z** undo · **Ctrl+Y** / **Ctrl+Shift+Z** redo |
+| Enlarged view | **← / →** previous/next page · **Home / End** · **Delete** mark/keep · **Esc** close |
+| Split | **← / →** nudge the cut (**Shift** = bigger steps) · **Enter** apply · **Esc** cancel |
+| Crop | **Enter** apply · **Esc** cancel |
 
 ## Build / package
 ```bash

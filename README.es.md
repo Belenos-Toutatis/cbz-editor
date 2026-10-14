@@ -14,11 +14,12 @@ Editor gráfico de archivos **CBZ** (cómics / manga), escrito en Rust con
 - 🪓 **Dividir** una página doble en dos (línea de corte **desplazable**, sentido **RTL/LTR**) · 🔗 **fusionar** dos páginas en una página doble.
 - 🧹 **Marcar duplicados**: marca para eliminar las páginas con **contenido idéntico** (bytes) en un clic.
 - ✂️ **Recortar** una página como **portada** (`000_cover.jpg`), marco desplazable/redimensionable.
-- 🔍 **Ampliar** una página (flechas para pasar páginas, Esc para volver) · 💾 **extraer** una página a un archivo.
+- 🔍 **Ampliar** una página (flechas para pasar páginas, **clic = tamaño real**, Esc para volver) · 💾 **extraer** una página a un archivo.
 - 🌍 **Interfaz en 5 idiomas** — francés, inglés, español, alemán, italiano (detectado según la configuración regional, cambiable en la barra superior).
 - Formatos leídos: **JPG, PNG, WebP, GIF, BMP**; páginas ordenadas en **orden natural** (`page2` antes que `page10`).
-- Conserva `ComicInfo.xml` y **recalcula `PageCount`**; escritura como ZIP *stored*.
+- Conserva `ComicInfo.xml` y **recalcula `PageCount`** (el bloque `<Pages>` se elimina si ya no corresponde); escritura como ZIP *stored*. La portada siempre queda **primera**.
 - Guardado **seguro**: una copia «… (editado).cbz» (nunca sobrescrita) o sobrescribir el original con copia `.bak` automática.
+- ↩️ **Deshacer / Rehacer** todos los cambios · aviso antes de **cerrar** o **abrir** otro archivo si quedan **cambios sin guardar**.
 
 ## Instalación
 
@@ -42,6 +43,14 @@ cbz-editor "Tomo.cbz"      # abre un archivo directamente
 **Clic derecho** en una página para el menú completo (dividir, fusionar, insertar, extraer, mover).
 **Arrastra** una miniatura para moverla; **arrastra** una imagen desde el explorador para insertarla.
 El **idioma** sigue tu sistema; un selector arriba a la derecha permite cambiarlo (se recuerda).
+
+### Atajos de teclado
+| Dónde | Teclas |
+|---|---|
+| En todas partes | **Ctrl+O** abrir · **Ctrl+S** guardar una copia · **Ctrl+Z** deshacer · **Ctrl+Y** / **Ctrl+Mayús+Z** rehacer |
+| Vista ampliada | **← / →** página anterior/siguiente · **Inicio / Fin** · **Supr** marcar/conservar · **Esc** cerrar |
+| División | **← / →** ajustar el corte (**Mayús** = pasos mayores) · **Intro** aplicar · **Esc** cancelar |
+| Recorte | **Intro** aplicar · **Esc** cancelar |
 
 ## Compilar / empaquetar
 ```bash

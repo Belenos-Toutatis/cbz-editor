@@ -10,6 +10,8 @@ cargo run --release            # lancer (passer un .cbz en argument pour l'ouvri
 cargo build --release          # binaire -> target/release/cbz-editor
 cargo build                    # debug : compile vite, mais décodage d'images lent
 cargo deb                      # paquet .deb (nécessite cargo-deb)
+cargo test --release           # tests de la logique hors GUI (module `tests` en fin de main.rs)
+cargo clippy --release         # doit rester sans avertissement
 ```
 **AppImage** (outils dans `.aitools/`, non versionnés) :
 ```bash
@@ -19,16 +21,34 @@ export APPIMAGE_EXTRACT_AND_RUN=1
   --icon-filename cbz-editor --output appimage
 mv "Éditeur_CBZ-x86_64.AppImage" cbz-editor-x86_64.AppImage
 ```
-Pas de tests automatisés : la logique est surtout interactive (GUI). Vérifier en lançant
-l'appli avec un vrai `.cbz` (un « smoke test » de 3-4 s suffit à confirmer qu'elle démarre).
+Tests automatisés **uniquement pour la logique** (`build_cbz`, ComicInfo, tri naturel, Défaire,
+lecture ZIP…). L'interface se vérifie en lançant l'appli avec un vrai `.cbz` — **toujours une copie**.
+Pour piloter la GUI (xdotool + captures), utiliser un **Xvfb** (`Xvfb :77` puis
+`env -u WAYLAND_DISPLAY DISPLAY=:77 …`) : sous la session Wayland, les clics simulés n'atteignent
+pas la fenêtre XWayland. Dans Xvfb : `xdotool windowfocus` avant les touches, et des clics en
+`mousedown`/`mouseup` séparés (~100 ms) sinon egui ne voit pas le clic.
 
 ## Architecture (`src/main.rs`)
 - `CbzApp` : état global. Pages en mémoire (`Vec<Page>`, octets d'origine conservés).
 - Modes mutuellement exclusifs, testés dans cet ordre dans `update()` :
   `viewer` (agrandissement) → `split` (découpe) → `crop` (recadrage couverture) → grille.
-- `Page { name, bytes, thumb, delete, uid }`. Le `uid` (stable) sert d'identité pour les
-  miniatures et le glisser-réordonner (pas l'index, qui bouge).
-- Miniatures générées **paresseusement** (quota par frame) pour ne pas figer l'UI.
+- `Page { name, bytes: Arc<[u8]>, thumb, failed, delete, uid }` (`Clone` bon marché : octets
+  partagés). Le `uid` (stable) sert d'identité pour les miniatures, le glisser-réordonner et la
+  resynchronisation après écrasement (pas l'index, qui bouge). Nouveaux uid via `new_uid()`.
+- Miniatures décodées **en arrière-plan** (`ThumbWorkers` : 1-4 threads, canaux mpsc) ; l'UI ne fait
+  que téléverser la texture. `generation` (incrémentée à l'ouverture) invalide les travaux d'un
+  fichier précédent ; `thumb_pending` évite les doublons d'envoi.
+- **Défaire/Refaire** : `checkpoint()` à appeler **juste avant chaque modification** (et seulement
+  si elle a lieu) ; pile de `Snapshot { pages, cover, dirty_order }` (max `UNDO_MAX`). Historique
+  vidé à l'ouverture et après « Écraser l'original ».
+- **Modifications non enregistrées** : `edit_sig()` (empreinte uid+delete+couverture) comparée à
+  `saved_sig` → `is_modified()`. Garde-fou (`confirm_discard`/`Pending`) avant ouvrir/déposer un
+  autre .cbz et à la fermeture (`close_requested` + `CancelClose`). Ouvrir passe par `request_open`.
+- **Barre d'état** en bas : `info(msg)` / `fail(msg)` (rouge) — ne pas affecter `status` directement.
+- **Palette** : couleurs centralisées dans `pal(ctx)` (variantes thème sombre/clair, egui suit le
+  système). Pas de `Color32` en dur dans l'UI, sauf superpositions dessinées sur une image.
+- Boîtes de confirmation non modales en egui 0.29 → le reste de l'UI est `ui.disable()` tant
+  qu'une boîte est ouverte (`modal` dans `update`), raccourcis désactivés, Échap = annuler.
 - **i18n** : toutes les chaînes d'UI passent par `tr(lang, T::Clé)` — table `Lang` × `T` indexée
   par `lang as usize` (5 colonnes : FR, EN, ES, DE, IT, **dans cet ordre**). `Lang::detect()` lit
   la locale (`LC_ALL`/`LC_MESSAGES`/`LANG`, repli EN) ; choix mémorisé via `save_lang`/`load_lang`
@@ -59,12 +79,22 @@ l'appli avec un vrai `.cbz` (un « smoke test » de 3-4 s suffit à confirmer qu
   de tri lexical) ; lecture ZIP **plafonnée** (512 Mio/entrée, 4 Gio au total) contre les bombes
   zip ; formats décodés **JPEG/PNG/WebP/GIF/BMP** ; une page illisible affiche un cadre
   « ⚠ illisible » cliquable (jamais de spinner infini, ni en grille ni dans le viewer).
-- **Enregistrement** (`build_cbz`) : couverture en `000_cover.jpg` ; `ComicInfo.xml` conservé,
+- **Glyphes** : les polices d'egui (Ubuntu-Light + NotoEmoji + emoji-icon-font ; Hack n'est que
+  pour la police **mono**) n'ont pas tout : `→ ← ↶ ↷ ⇄ ● ◫ 🧹 🪓 ⤒ ⤓ ʳ ᵉ` s'affichent en carré
+  vide. Vérifier tout nouveau symbole avec fontTools sur `epaint_default_fonts-*/fonts/` (sans Hack).
+  Choix actuels : ⟲/⟳ défaire/refaire, ⬅/➡ flèches, ✂ recadrer, 📖 découper, 🗐 doublons, ⏮/⏭.
+- **Enregistrement** (`build_cbz` → `Built`) : couverture en `000_cover.<ext>` (une **seule** page
+  `000_cover` existante sert de couverture, avec son extension) ; `ComicInfo.xml` conservé,
   `PageCount` réécrit (au **niveau octets**, pour préserver un XML non‑UTF‑8). Les pages gardent
   leur **nom d'origine** SAUF si l'ordre a changé (`dirty_order` : réordre/insertion/fusion/découpe)
-  → renumérotées `p0000.jpg`… pour figer l'ordre (les lecteurs trient par nom). Écriture
+  → renumérotées `p0000.jpg`… pour figer l'ordre (les lecteurs trient par nom) — renumérotation
+  aussi si une page serait triée avant la couverture. Bloc `<Pages>` du ComicInfo retiré
+  (`strip_pages_block`) dès que la liste change. Refus d'enregistrer si aucune page ne reste.
+  Après « Écraser », `sync_after_overwrite` aligne l'état mémoire sur le fichier écrit (pages
+  supprimées retirées, noms définitifs, couverture devenue page 1). Écritures avec `fsync`. Écriture
   **atomique** (.tmp puis rename) + `.bak`. « Enregistrer une copie » n'écrase jamais une copie
-  existante (suffixe `(édité 2)`…). `encode_jpeg` remonte ses erreurs (pas de page vide silencieuse).
+  existante (suffixe `(édité 2)`…). `encode_jpeg` remonte ses erreurs (pas de page vide silencieuse) et aplatit
+  la transparence sur blanc. Lecture : entrées `__MACOSX/` et `._*` ignorées.
 - **Sens de lecture** (`rtl`) déduit du `ComicInfo` (`YesAndRightToLeft`), modifiable dans l'UI ;
   il pilote l'ordre des fusion/découpe.
 - `last_dir` et la langue persistés dans `~/.config/cbz-editor/` (`last_dir`, `lang`).
@@ -91,6 +121,8 @@ au dépôt** (`git config user.email` local). Ne pas remettre d'e-mail personnel
 versionnés ni dans `Cargo.toml` (`maintainer`).
 
 ## Conventions
+- Code formaté avec `rustfmt` (la table `tr`, trop large, est laissée telle quelle par rustfmt :
+  garder **une ligne par clé**).
 - **Commentaires** et noms de symboles en **français** ; **interface multilingue** (FR/EN/ES/DE/IT)
   via la table `tr` (voir « i18n » plus haut).
 - **README par langue** : `README.md` (FR, primaire) + `README.en.md` / `README.es.md` /
